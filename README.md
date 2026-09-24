@@ -3,100 +3,131 @@
 A small collection of Python command-line tools.
 
 - **Drip Writer**: types out text you paste into it, into any window, with randomized human-like pauses between keystrokes.
-- **AI Screen Solver**: reads math and quiz questions off your screen with an AI model and fills in the answers for you.
+- **AI Solver**: reads math and quiz questions off your screen with an AI model and fills in the answers for you.
 
-Everything below is done in the command line.
+All commands below are typed into the command line:
 - **Windows:** press the Start button, type `Terminal`, and open it.
 - **Mac:** press `Cmd + Space`, type `Terminal`, and open it.
 
-> **Heads up:** Windows and Mac use different commands for Python. Windows uses `py`. Mac uses `python3`. Follow the section for your system.
+Copy and paste each command **one at a time**, pressing Enter after each one.
+
+> Windows and Mac use different commands. Only follow the steps for your system.
 
 ---
 
-## 1. Install Python
+## Step 1: Install Python
 
-Download and run the installer for your system from:
+Download and run the installer from **[python.org/downloads](https://www.python.org/downloads/)** (it works for both Windows and Mac). Use the default options.
 
-**[python.org/downloads](https://www.python.org/downloads/)**
-
-The site detects Windows or Mac automatically. Run the installer with the default options.
-
-When it's done, open a new Terminal and check that it worked:
+Then open a **new** Terminal and check that it worked.
 
 **Windows:**
 ```
 py --version
 ```
+
 **Mac:**
 ```
 python3 --version
 ```
 
+If it shows a version number, you're ready.
+
 ---
 
-## 2. Drip Writer
+## Step 2: Drip Writer
 
-### Download it
+### 2.1 Download it
 Open `dripwriter.py` in this GitHub repo and click the **Download raw file** button (the download icon near the top right of the file). It saves to your **Downloads** folder.
 
-### Go to your Downloads folder
+### 2.2 Install its dependencies (one time only)
+
+**Windows:**
+```
+py -m pip install keyboard
+```
+
+**Mac:**
+```
+python3 -m pip install keyboard
+```
+
+### 2.3 Go to your Downloads folder
 
 **Windows:**
 ```
 cd Downloads
 ```
+
 **Mac:**
 ```
 cd ~/Downloads
 ```
 
-### Install and run
+### 2.4 Run it
 
 **Windows:**
 ```
-py -m pip install keyboard
 py dripwriter.py
 ```
+
 **Mac:**
 ```
-python3 -m pip install keyboard
 python3 dripwriter.py
 ```
 
-> **Mac note:** macOS blocks apps from reading keystrokes until you allow it. If pressing Backspace does nothing, go to **System Settings → Privacy & Security → Accessibility** and turn it on for **Terminal**, then restart Terminal.
+### From now on
+You only need steps **2.3** and **2.4** each time you want to use it: go to the folder, then run it.
+
+> **Mac note:** if pressing Backspace does nothing, go to **System Settings → Privacy & Security → Accessibility**, turn it on for **Terminal**, then restart Terminal.
 
 ---
 
-## 3. AI Screen Solver
+## Step 3: AI Solver
 
-### Download it
+### 3.1 Download it
 1. On this repo's GitHub page, click the green **Code** button, then **Download ZIP**.
-2. Unzip it and move the **`ai-solver`** folder into your **Downloads** folder.
+2. Unzip it and move the **`AI_Solver`** folder into your **Downloads** folder.
 
-### Go to the folder
-
-**Windows:**
-```
-cd Downloads\ai-solver
-```
-**Mac:**
-```
-cd ~/Downloads/ai-solver
-```
-
-### Install and run
+### 3.2 Install its dependencies (one time only)
 
 **Windows:**
 ```
 py -m pip install keyboard pyautogui pyperclip python-dotenv google-genai openai pillow pydantic
-py solver.py
 ```
+
 **Mac:**
 ```
 python3 -m pip install keyboard pyautogui pyperclip python-dotenv google-genai openai pillow pydantic
+```
+
+### 3.3 Go to the AI_Solver folder
+
+**Windows:**
+```
+cd Downloads\AI_Solver
+```
+
+**Mac:**
+```
+cd ~/Downloads/AI_Solver
+```
+
+### 3.4 Run it
+
+**Windows:**
+```
+py solver.py
+```
+
+**Mac:**
+```
 python3 solver.py
 ```
 
-> **Mac note:** besides the Accessibility permission above, the solver needs to see your screen. Turn on **System Settings → Privacy & Security → Screen Recording** for **Terminal**, then restart Terminal.
+### From now on
+You only need steps **3.3** and **3.4** each time you want to use it: go to the folder, then run it.
+
+> **Mac note:** the solver needs the same **Accessibility** permission as Drip Writer, plus **System Settings → Privacy & Security → Screen Recording** turned on for **Terminal** so it can see your screen. Restart Terminal after changing either.
 
 The solver needs an API key to work. That setup (the `.env` file) is coming in a later update to this README.
