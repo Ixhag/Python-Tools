@@ -1,9 +1,8 @@
 # Python Tools
 
 A small collection of Python command-line tools.
-
-- **Drip Writer**: types out text you paste into it, into any window, with randomized human-like pauses between keystrokes.
-- **AI Solver**: reads math and quiz questions off your screen with an AI model and fills in the answers for you.
+- **Drip Writer**: types out text you paste into it, into any window, with randomized pauses between keystrokes.
+- **AI Solver**: reads questions off your screen with an AI model and fills in the answers for you.
 
 All commands below are typed into the command line:
 - **Windows:** press the Start button, type `Terminal`, and open it.
@@ -35,7 +34,7 @@ If it shows a version number, you're ready.
 
 ---
 
-## Step 2: Drip Writer
+## Drip Writer
 
 ### 2.1 Download it
 Open `dripwriter.py` in this GitHub repo and click the **Download raw file** button (the download icon near the top right of the file). It saves to your **Downloads** folder.
@@ -83,13 +82,13 @@ You only need steps **2.3** and **2.4** each time you want to use it: go to the 
 
 ---
 
-## Step 3: AI Solver
+## AI Solver
 
-### 3.1 Download it
+### 2.1 Download it
 1. On this repo's GitHub page, click the green **Code** button, then **Download ZIP**.
 2. Unzip it and move the **`AI_Solver`** folder into your **Downloads** folder.
 
-### 3.2 Install its dependencies (one time only)
+### 2.2 Install its dependencies (one time only)
 
 **Windows:**
 ```
@@ -101,7 +100,7 @@ py -m pip install keyboard pyautogui pyperclip python-dotenv google-genai openai
 python3 -m pip install keyboard pyautogui pyperclip python-dotenv google-genai openai pillow pydantic
 ```
 
-### 3.3 Go to the AI_Solver folder
+### 2.3 Go to the AI_Solver folder
 
 **Windows:**
 ```
@@ -113,7 +112,7 @@ cd Downloads\AI_Solver
 cd ~/Downloads/AI_Solver
 ```
 
-### 3.4 Run it
+### 2.4 Run it
 
 **Windows:**
 ```
@@ -126,7 +125,7 @@ python3 solver.py
 ```
 
 ### From now on
-You only need steps **3.3** and **3.4** each time you want to use it: go to the folder, then run it.
+You only need steps **2.3** and **2.4** each time you want to use it: go to the folder, then run it.
 
 > **Mac note:** the solver needs the same **Accessibility** permission as Drip Writer, plus **System Settings → Privacy & Security → Screen Recording** turned on for **Terminal** so it can see your screen. Restart Terminal after changing either.
 
