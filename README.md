@@ -38,7 +38,8 @@ If it shows a version number, you're ready. Open the tool you want below and con
 <summary><strong>Step 2: Drip Writer</strong> (click to open)</summary>
 
 ### 2.1 Download it
-Open `dripwriter.py` in this GitHub repo and click the **Download raw file** button (the download icon near the top right of the file). It saves to your **Downloads** folder.
+1. On this repo's GitHub page, click the **Code** button, then **Download ZIP** or .
+2. Unzip it and move the **`AI_Solver`** folder into your **Downloads** folder.
 
 ### 2.2 Install its dependencies (one time only)
 
@@ -52,16 +53,16 @@ py -m pip install keyboard
 python3 -m pip install keyboard
 ```
 
-### 2.3 Go to your Downloads folder
+### 2.3 Go to Dripwriter in your Downloads folder
 
 **Windows:**
 ```
-cd Downloads
+cd Downloads/dripwriter
 ```
 
 **Mac:**
 ```
-cd ~/Downloads
+cd ~/Downloads/dripwriter
 ```
 
 ### 2.4 Run it
@@ -111,7 +112,7 @@ python3 -m pip install keyboard pyautogui pyperclip python-dotenv google-genai o
 
 Keep this key private, like a password.
 
-### 2.4 Go to the AI_Solver folder
+### 2.4 Go to the AI_Solver in your Downloads folder
 
 **Windows:**
 ```
