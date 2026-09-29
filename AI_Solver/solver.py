@@ -1,9 +1,21 @@
+# ============================================================
+# QUICK SWITCHES (the ones you flip most often)
+# ============================================================
+# Save a screenshot after every press (AFTER the answers are filled in) to
+# the "tempscreenshots" folder next to this script. Never auto-deleted.
+SAVE_SCREENSHOTS = False
+
+# Rising chime when the answers are filled in; low falling tone when the AI
+# gives no usable solution. (No sound on the emergency stop.)
+PLAY_SOUNDS = True
+
 import base64
 import io
 import json
 import math
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -37,22 +49,29 @@ except ImportError:
 # ============================================================
 # CONFIG
 # ============================================================
-
-# ---------------- QUICK SWITCHES ----------------
-# Save a screenshot of the screen after every press (answers already filled
-# in) into the "tempscreenshots" folder next to this script. More settings
-# for this further down (search for SCREENSHOT_FOLDER).
-SAVE_SCREENSHOTS = False
-
-# Sounds: a chime when the answers are filled in, and a low "error" tone when
-# the AI can't give a solution (no answer, no agreement, or an error).
-# False = completely silent. Sound settings further down (search PING_).
-PLAY_SOUNDS = True
-
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+# Values that mean "no key yet" (the .env in the repo ships with a placeholder).
+_PLACEHOLDER_KEYS = {"ENTER_KEY_HERE", "YOUR_KEY_HERE", "YOUR_API_KEY", "CHANGEME"}
+
+
+def read_key(name: str) -> str:
+    """Read an API key from the environment / .env. Returns "" when it is
+    missing or still the placeholder, so the rest of the program treats it
+    as "no key" instead of sending a fake key and getting auth errors."""
+    value = os.getenv(name, "").strip().strip('"').strip("'").strip()
+    if value.upper() in _PLACEHOLDER_KEYS:
+        return ""
+    return value
+
+
+def key_is_placeholder(name: str) -> bool:
+    raw = os.getenv(name, "").strip().strip('"').strip("'").strip()
+    return raw.upper() in _PLACEHOLDER_KEYS
+
+
+GEMINI_API_KEY = read_key("GEMINI_API_KEY")
+OPENROUTER_API_KEY = read_key("OPENROUTER_API_KEY")
 
 # ---------------- Gemini model switches ----------------
 # Which model(s) are enabled. What this MEANS depends on the GEMINI MODE
@@ -72,6 +91,19 @@ USE_GEMINI_3_8_FLASH = False        # gemini-3.8-flash       (20/day free)
 # NOTE: "minimal" is NOT supported by gemini-3.8-flash and returns an error.
 GEMINI_THINKING = "medium"
 
+# LOCAL MATHS (fast + exact): Gemini writes each numeric answer's
+# calculation as a formula, e.g. exp(-3.42) rounded to 4 places, and YOUR PC
+# works it out exactly (well under a millisecond) and types that result - so
+# arithmetic/rounding slips by the AI can't get through. Only plain maths is
+# allowed in the formula (numbers, + - * / ^, exp, ln, log, sqrt, trig...);
+# anything else is ignored and the AI's own answer is used.
+LOCAL_MATH = True
+
+# Let Gemini write and RUN Python in Google's sandbox instead. Much SLOWER:
+# every run is a round trip to Google (one e^-3.42 question took 38s with 7
+# runs). LOCAL_MATH above gets the arithmetic right without that wait.
+GEMINI_CODE_EXECUTION = False
+
 # ---------------- GEMINI MODE (pick ONE of these True) ----------------
 # GEMINI_ONLY: only Gemini is used at all - OpenRouter is skipped entirely.
 # Turn this OFF to fall back to Gemini + OpenRouter multi-AI consensus
@@ -90,13 +122,66 @@ GEMINI_ONLY = True
 #     see CONSENSUS_MIN) before anything is clicked or typed. E.g. turn on
 #     both Flash-Lite models with this True and they must consult and agree
 #     on each answer. Needs at least 2 models enabled to do anything.
-# If both are True, Consult wins.
+#   - USE_GEMINI_FLASH_CYCLE: uses the (non-Lite) Flash models in
+#     FLASH_CYCLE_MODELS below, one at a time, at GEMINI_THINKING. It stays on
+#     the first one until that model's free daily limit (20/day) runs out,
+#     then moves to the next one automatically, in the SAME press - you don't
+#     lose the press. When every Flash model is used up it falls back to
+#     FLASH_CYCLE_FALLBACK. Ignores the individual switches above. Models come
+#     back automatically when Google resets the daily limits (midnight
+#     Pacific time), and used-up models are remembered across restarts.
+# If more than one is True: Consult wins, then Cycle, then Race.
 USE_GEMINI_FLASH_RACE = False
 GEMINI_CONSULT = False
+USE_GEMINI_FLASH_CYCLE = False
+
+# Consult mode: how many times to ask EACH enabled model (all at the same
+# time, so it barely adds waiting). E.g. both Flash-Lite models on and this
+# at 2 = 4 answers per press; an answer is only filled in when the majority
+# agree (at least CONSENSUS_MIN, and more votes than any other answer).
+# Also works with just ONE model on (e.g. 3 = ask it 3 times and vote).
+# Each ask counts against that model's daily limit.
+GEMINI_CONSULT_REPEAT = 1
+
+# Flash Cycle order: the first one is used until it runs out, then the next.
+# Reorder or remove models freely.
+FLASH_CYCLE_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+]
+# Used once ALL the Flash models above are used up for the day
+# ("" = no fallback: presses just fail with the error tone until the reset).
+FLASH_CYCLE_FALLBACK = "gemini-3.5-flash-lite"
+# The cycle remembers which models are used up (until Google's daily reset)
+# across restarts. Set True to forget all of that when the program starts -
+# e.g. if you think a model was wrongly marked as used up.
+RESET_FLASH_CYCLE_ON_START = False
 
 OPENROUTER_MODEL = "openrouter/free"
 
 HOTKEY = "ctrl+alt+s"
+
+# SAFETY: controls the program will NEVER click, whatever the AI says. An
+# option whose label matches one of these (upper/lower case ignored) is
+# thrown out and reported as [BLOCKED]. Covers quiz-site navigation like a
+# "Question list" sidebar (whose circles look just like radio buttons).
+# Add your own as needed.
+NEVER_CLICK_LABELS = [
+    r"question\s*\d+",           # "Question 3" in a question list
+    r"question list",
+    r"(next|previous|prev|back|submit|save|close|menu)( question)?",
+    r"check answer", r"clear all", r"help me solve this",
+    r"view an example", r"textbook", r"similar question", r"try again",
+]
+
+# SAFETY: screen areas (in pixels: left, top, right, bottom) where nothing is
+# ever clicked or typed. E.g. your quiz site's question list sidebar on a
+# 2560x1440 screen: NEVER_CLICK_ZONES = [(0, 0, 505, 1440)]
+# (Only use it if the sidebar is always open - if you collapse it, the
+# question moves into that area and its boxes would be blocked too.)
+NEVER_CLICK_ZONES = []
 
 # Keep TRUE while testing coordinates.
 # Set FALSE only after you verify the mouse reaches the correct control.
@@ -120,7 +205,7 @@ EARLY_EXIT = True
 
 # Network timeout per request, in seconds (prevents a hung request from
 # blocking the whole run).
-REQUEST_TIMEOUT = 45
+REQUEST_TIMEOUT = 90  # code execution + high thinking can take a while
 
 # Screenshots wider than this are downscaled before upload. 0 = send at
 # full native resolution (no resize) - PRECISION MATTERS MORE THAN SPEED
@@ -132,6 +217,17 @@ REQUEST_TIMEOUT = 45
 IMAGE_MAX_WIDTH = 0
 IMAGE_FORMAT = "PNG"  # "PNG" (lossless - sharper box edges) or "JPEG" (smaller/faster)
 JPEG_QUALITY = 85
+
+# How much detail GEMINI actually looks at. This is the setting that really
+# controls "image quality": however sharp the PNG is, Gemini shrinks every
+# image down to a fixed token budget before reading it.
+#   "ultra_high" = 2240 tokens (2x the default - Google recommends it for
+#                  reading screens / computer use; a little slower)
+#   "high"       = 1120 tokens (same as the default)
+#   ""           = don't send the setting at all
+# If a model rejects "ultra_high", the program notices once, prints a note,
+# and falls back to the default for the rest of the run.
+GEMINI_IMAGE_DETAIL = "ultra_high"
 
 # Keep API connections open this long when idle. httpx's default is only 5s,
 # which throws away the warm connection between hotkey presses and forces a
@@ -153,24 +249,31 @@ CLICK_SETTLE_SECONDS = 0.05
 # glide there over this many seconds instead of jumping.
 MOVE_DURATION_SECONDS = 0.05
 
-# Pause after finishing one radio/checkbox option before clicking the next
-# one, so the page has time to process a blur/focus change. Only used when
-# a single press selects more than one option; not applied to text boxes,
-# since only ever one is filled per press (see ONE_TEXT_BOX_PER_PRESS).
+# Pause between one control and the next (option clicks and text boxes),
+# so the page has time to process a blur/focus change. Not added after the
+# last control.
 TASK_GAP_SECONDS = 0.1
 
-# A question with a radio/checkbox option AND several text blanks (e.g.
-# "the solution is x=_, y=_, z=_") is filled in ACROSS MULTIPLE PRESSES:
-# one press selects the option and fills the FIRST blank, then stops -
-# press the hotkey again for each remaining blank. Each press re-screenshots
-# from scratch anyway, so this sidesteps a real problem for free: filling in
-# one blank can resize it and shift the others (a box widening to fit what
-# was typed, a row reflowing once an option is picked), which made trying
-# to fill several blanks in one pass unreliable. A question with only ONE
-# control (a single text box, or a plain option with no blanks) is
-# unaffected and still finishes in a single press. Set False to always
-# attempt every blank in one press with their original positions.
+# Multi-blank questions:
+#   - Several text boxes and NO radio/checkbox option to pick (e.g.
+#     "x = [ ], y = [ ], z = [ ]" on its own): ALL boxes are filled in the
+#     SAME press. No re-pressing needed.
+#   - An option that has to be SELECTED and contains blanks (e.g.
+#     "(o) The solution is x = [ ], y = [ ]"): with this True, one press
+#     selects the option and fills the FIRST blank, then you press again for
+#     the rest - selecting an option can reflow the page, so the positions of
+#     its other blanks from the screenshot may be stale. On the next press
+#     the option is already selected, so the remaining blanks are all filled
+#     together. Set False to fill every blank right after the option click.
 ONE_TEXT_BOX_PER_PRESS = True
+
+# Fill controls from the BOTTOM of the page up (and right-to-left within a
+# line). Typing into a box can widen it and push everything AFTER it right
+# or down, but it never moves anything BEFORE it - so going last-to-first
+# means every box is still exactly where the screenshot showed it when it is
+# reached. Within one question the option is still clicked before its
+# blanks. Costs nothing. Set False for plain top-to-bottom order.
+FILL_BOTTOM_TO_TOP = True
 
 # pyperclip.copy() followed immediately by Ctrl+V had ZERO gap before this -
 # on Windows the clipboard can transiently fail to update (a clipboard
@@ -186,24 +289,39 @@ CLIPBOARD_COPY_RETRIES = 3
 # checkbox twice toggles it back OFF.
 DOUBLE_CLICK_OPTIONS = True
 
+# SNAP TO THE REAL CONTROL: the AI's box is an estimate that can be a few
+# pixels off (or land on an option's label instead of its circle). Before
+# clicking, the program looks at the SAME screenshot it sent to the AI, finds
+# the actual text-box border / radio circle / checkbox near the AI's guess,
+# and clicks its exact centre. Pure local pixel work - a few milliseconds, no
+# extra screenshot, no retries. If it can't find a clear control nearby it
+# simply uses the AI's position, exactly as before.
+SNAP_TO_CONTROLS = True
+
+# Two answers must never go into the same box (Ctrl+A would silently
+# overwrite the first one). If two text answers would land in one box, the
+# one the AI placed closest is typed and the other waits for the next press.
+PREVENT_SAME_BOX = True
+
 # type_text: click the field TWICE, as two separate clicks with a short
 # pause between them (not one native double-click - see perform_task for
 # why), before Ctrl+A selects everything and the answer is pasted in.
 DOUBLE_CLICK_TEXTBOXES = True
 
+# ---- Sounds (master switch PLAY_SOUNDS is at the very top) ----
 # Optional: path to your OWN .wav file to play instead of the built-in chime
 # (Windows plays .wav only), e.g. r"C:\Sounds\ping.wav". Leave "" for the chime.
 PING_SOUND_FILE = ""
 
-# Built-in chime: two soft rising notes (a gentle "messaging app" style ding).
+# Built-in "done" chime: two soft rising notes.
 PING_NOTES_HZ = (988, 1319)      # first note, second note
 PING_NOTE_MS = (90, 220)         # how long each note rings
-PING_VOLUME = 0.45               # 0.0 - 1.0 (both sounds)
+PING_VOLUME = 0.45               # 0.0 - 1.0
 
-# Error tone, played when the AI can't give a solution: two LOWER notes
-# going DOWN, so it's easy to tell apart from the "done" chime by ear.
-ERROR_NOTES_HZ = (440, 294)
-ERROR_NOTE_MS = (150, 320)
+# Built-in "no usable answer" tone: two low falling notes.
+ERROR_NOTES_HZ = (392, 262)
+ERROR_NOTE_MS = (160, 320)
+ERROR_VOLUME = 0.45
 
 # After each press FINISHES (the AI has answered and the answers have been
 # clicked/typed in), a NEW screenshot is taken and saved as a PNG in this
@@ -215,7 +333,13 @@ ERROR_NOTE_MS = (150, 320)
 # you delete it. Nothing is ever deleted automatically - clear it out by hand
 # whenever you like. Files are named by date and time, e.g.
 # screenshot_2026-09-24_14-05-33-123.png, so they sort in the order taken.
-# (Turn this on/off with SAVE_SCREENSHOTS at the top of the file.)
+# (The on/off switch SAVE_SCREENSHOTS is at the very top of the file.)
+
+# Draw a small red ring on the saved screenshot at every spot that was
+# clicked, so you can tell a WRONG ANSWER apart from a WRONG POSITION when
+# something is missed.
+MARK_CLICKS_ON_SCREENSHOTS = True
+
 # Short wait before that final screenshot, so the page has finished showing
 # the typed answers / selected options.
 SCREENSHOT_DELAY_SECONDS = 0.3
@@ -227,6 +351,7 @@ pyautogui.PAUSE = 0
 pyautogui.FAILSAFE = True
 
 busy_lock = threading.Lock()
+_clicked_points = []  # screen spots clicked this press (for marked screenshots)
 
 # ============================================================
 # DATA MODELS
@@ -250,14 +375,56 @@ class Task(BaseModel):
     # option reading "x = __, y = __, z = __" needs 3 type_text tasks, each
     # with its own part: "x", "y", "z"). None for a single-control question.
     part: Optional[str] = None
+    # Exact screen pixel to click, set when the control was snapped to on the
+    # screenshot (see SNAP_TO_CONTROLS). None = use the centre of bbox.
+    click: Optional[List[int]] = None
+    # LOCAL_MATH: the formula for this answer (e.g. "exp(-3.42)") and how
+    # many decimal places to round it to (None = exact).
+    calc: Optional[str] = None
+    round_to: Optional[int] = None
 
 
 class SolverResponse(BaseModel):
     tasks: List[Task] = Field(default_factory=list)
 
 
-# Computed once instead of on every request.
-SOLVER_SCHEMA = SolverResponse.model_json_schema()
+# What the AI is asked to return. Boxes use Gemini's native detection format
+# "box_2d": [ymin, xmin, ymax, xmax] normalised 0-1000 (the format Google's
+# own object-detection examples use), and are converted to BoundingBox when
+# parsed. Property order matters: the model writes the question and answer
+# BEFORE it locates the control.
+_NULLABLE_STR = {"anyOf": [{"type": "string"}, {"type": "null"}]}
+SOLVER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "tasks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "question_id": {"type": "string"},
+                    "question": {"type": "string"},
+                    "calc": _NULLABLE_STR,
+                    "round_to": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                    "answer": {"type": "string"},
+                    "input_type": {"type": "string", "enum": ["type_text", "click_option"]},
+                    "option": _NULLABLE_STR,
+                    "part": _NULLABLE_STR,
+                    "box_2d": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "[ymin, xmin, ymax, xmax] normalized to 0-1000",
+                    },
+                },
+                "required": [
+                    "question_id", "question", "calc", "round_to", "answer",
+                    "input_type", "option", "part", "box_2d",
+                ],
+            },
+        }
+    },
+    "required": ["tasks"],
+}
 
 # ============================================================
 # SHARED API CLIENTS (created once -> connection reuse, no repeated
@@ -365,13 +532,13 @@ belonging to the OTHER, unselected options must be left alone entirely -
 do not emit tasks for them.
 Rules for these questions:
 - Emit ONE task with input_type "click_option" for the radio button/option
-  itself (bbox = ONLY the small circle/checkbox graphic itself, tightly -
-  see the bbox rule below for why).
+  itself (box_2d = ONLY the small circle/checkbox graphic itself, tightly -
+  see the box_2d rule below for why).
 - Emit ONE SEPARATE task with input_type "type_text" for EVERY individual
   blank inside that option - never merge two blanks into one task and
   never put two answers in one "answer" string (e.g. never "x=1, y=2").
   If the option reads "x = [ ], y = [ ], z = [ ]", that is 3 separate
-  type_text tasks, each with its own tiny bbox around just that one blank
+  type_text tasks, each with its own tight box_2d around just that one blank
   and its own single value in "answer" (e.g. "5", not "x=5").
 - ALL tasks that belong to the same question (the click_option task and
   every type_text task) share the SAME question_id, and should carry a
@@ -380,6 +547,13 @@ Rules for these questions:
     each blank: part = the variable/label immediately before it if visible
       (e.g. "x", "y", "z", "r"), otherwise "1", "2", "3"... in the order
       the blanks appear (left-to-right, top-to-bottom).
+- The same applies to a question with SEVERAL text boxes and NO option to
+  select (e.g. "x = [ ], y = [ ], z = [ ]" on its own): one type_text task
+  per box, all with the same question_id and each with its own part.
+- For every multi-box question, first COUNT the empty boxes that belong to
+  it, then return exactly that many type_text tasks - no box skipped, no
+  two tasks on the same box. Neighbouring boxes are separate controls even
+  when they sit very close together on one line.
 - A question with only ONE control (a single text box, or a plain radio
   list with no embedded blanks) still gets exactly ONE task, part = null.
 
@@ -393,7 +567,20 @@ CRITICAL RULES:
 - NEVER identify or click Next, Previous, Submit, Save, Close,
   Menu, browser controls, tabs, scrollbars, headers, footers,
   or other navigation controls.
-- ONLY identify an actual answer field or actual answer option.
+- IGNORE SIDE PANELS AND QUESTION LISTS COMPLETELY. A "Question list" /
+  question menu (entries like "Question 1", "Question 2", "Question 3" with
+  circles, check marks or ticks beside them) is NAVIGATION: those circles
+  are progress indicators showing which questions are done, NOT answer
+  options, even though they look like radio buttons. Clicking one leaves
+  the current question and loses the work. Never return a task for them.
+- Never click page buttons such as Check answer, Clear all, Help me solve
+  this, View an example, Textbook, Similar question, Try again.
+- ONLY answer the question shown in the main work area, and ONLY identify
+  an actual answer field or actual answer option inside it.
+- Questions with parts (a), (b), (c)... often reveal the next part's box
+  only after the previous part is answered. Answer EVERY part that
+  currently shows an EMPTY box; parts whose boxes are already filled in
+  are done.
 - SKIP ANY CONTROL THAT IS ALREADY ANSWERED - this is critical, since the
   screenshot may be mid-way through a worksheet someone is filling in:
     * A text box that ALREADY contains a typed value (not empty, not
@@ -407,22 +594,38 @@ For each task return:
 - question_id: visible question number if available, e.g. "1". The SAME
   value for every task belonging to the same question.
 - question: concise transcription of the visible question.
+- calc: for a type_text answer that is a NUMBER worked out from numbers
+  (arithmetic, powers, exponentials, logarithms, roots, trig, a solved
+  equation's value, ...), ONE formula that computes it from the numbers in
+  the question - the program calculates it exactly and types that result.
+  Allowed: numbers, + - * / ^ ( ), pi, e, and exp(x), ln(x), log(x) (= ln),
+  log(x, base), log10(x), log2(x), sqrt(x), cbrt(x), root(x, n), abs(x),
+  factorial(n), comb(n, k), perm(n, k), floor(x), ceil(x), sin/cos/tan and
+  asin/acos/atan (radians), sind/cosd/tand and asind/acosd/atand (degrees).
+  Always write * for multiplication ("2*pi", never "2pi").
+  Examples: e^(-3.42) -> "exp(-3.42)"; 3^x = 20 -> "ln(20)/ln(3)";
+  1000(1 + 0.05/12)^(12*3) -> "1000*(1+0.05/12)^(12*3)".
+  Use null when the answer is not a single number (an expression with a
+  variable, an interval, a list, text) or for click_option tasks.
+- round_to: the number of decimal places the question asks the answer to
+  be rounded to (nearest ten-thousandth = 4, nearest hundredth = 2, nearest
+  whole number = 0). null if the question wants an exact answer.
 - answer: the single value for THIS control only (one option's text, or
   one blank's value). Never combine multiple blanks' values into one.
 - input_type:
     "type_text" for a text/math answer box
     "click_option" for a multiple-choice/radio/checkbox option
-- bbox: bounding box of the ACTUAL, SINGLE answer control, NOT the whole
+- box_2d: bounding box of the ACTUAL, SINGLE answer control, NOT the whole
   question and NOT a whole row containing several blanks.
-  For click_option: bbox ONLY the small circle/checkbox graphic itself -
+  For click_option: box_2d ONLY the small circle/checkbox graphic itself -
   TIGHT around just that icon, NOT the option's label text, and NOT the
   whole row. The circle is a real, always-clickable native control; the
   text label next to it is NOT guaranteed to be clickable on every site,
   so a click that lands on the letter or words instead of the circle can
   silently fail to select anything.
-  For type_text: just the one input box itself.
-  Coordinates MUST be normalized to 0..1000:
-    x1 = left, y1 = top, x2 = right, y2 = bottom.
+  For type_text: just the one input box itself, edge to edge.
+  Format: [ymin, xmin, ymax, xmax], normalized to 0-1000 (0,0 = top-left
+  of the screenshot, 1000,1000 = bottom-right). Note the order: y first.
 - option:
     for click_option, transcribe visible option text when possible.
     for type_text, use null.
@@ -435,11 +638,16 @@ Math rules:
 - Use radicals rather than decimals when requested.
 - For multiple answers, preserve the requested order/separator.
 - For multiple choice, answer must be the option text.
+- Fractions: fully simplified, e.g. "3/4" not "6/8". Follow any rounding
+  instruction exactly (e.g. "round to two decimal places").
+- CHECK every answer before returning it: substitute it back into the
+  original equation(s) / re-do the calculation a second way. If the check
+  fails, solve again.
 
 Before returning, verify:
 A. Every task is visibly present.
 B. The answer is mathematically correct.
-C. Each bbox is on exactly ONE actual answer control, never a whole row
+C. Each box_2d is on exactly ONE actual answer control, never a whole row
    of multiple blanks.
 D. No navigation control is included.
 E. If the chosen option contains multiple blanks, there is one
@@ -455,29 +663,35 @@ option click and two separate blanks inside that option:
     {
       "question_id": "1",
       "question": "Solve the system. Select the correct choice.",
+      "calc": null,
+      "round_to": null,
       "answer": "The solution is x = _, y = _, and z = _.",
       "input_type": "click_option",
-      "bbox": {"x1": 30, "y1": 335, "x2": 44, "y2": 355},
       "option": "A. The solution is x = , y = , and z = .",
-      "part": null
+      "part": null,
+      "box_2d": [337, 30, 353, 44]
     },
     {
       "question_id": "1",
       "question": "Solve the system. Select the correct choice.",
+      "calc": "4",
+      "round_to": null,
       "answer": "4",
       "input_type": "type_text",
-      "bbox": {"x1": 140, "y1": 335, "x2": 155, "y2": 350},
       "option": null,
-      "part": "x"
+      "part": "x",
+      "box_2d": [335, 140, 350, 155]
     },
     {
       "question_id": "1",
       "question": "Solve the system. Select the correct choice.",
+      "calc": "-3",
+      "round_to": null,
       "answer": "-3",
       "input_type": "type_text",
-      "bbox": {"x1": 175, "y1": 335, "x2": 190, "y2": 350},
       "option": null,
-      "part": "y"
+      "part": "y",
+      "box_2d": [335, 175, 350, 190]
     }
   ]
 }
@@ -487,15 +701,31 @@ A simple question with exactly one control looks like this instead:
   "tasks": [
     {
       "question_id": "2",
-      "question": "...",
-      "answer": "...",
+      "question": "Use a calculator to find the value to the nearest ten-thousandth. e^(-3.42)",
+      "calc": "exp(-3.42)",
+      "round_to": 4,
+      "answer": "0.0327",
       "input_type": "type_text",
-      "bbox": {"x1": 400, "y1": 500, "x2": 520, "y2": 550},
       "option": null,
-      "part": null
+      "part": null,
+      "box_2d": [500, 400, 550, 520]
     }
   ]
 }
+"""
+
+# Added to the prompt when GEMINI_CODE_EXECUTION is on.
+CODE_EXECUTION_PROMPT = r"""
+
+YOU CAN RUN PYTHON CODE. Use it for ALL the maths:
+- First read every question and its numbers carefully from the screenshot.
+- Then write and run Python for every calculation. Use sympy for exact
+  algebra (sympy.Rational for fractions, sympy.linsolve / sympy.solve for
+  equations and systems, sympy.simplify / sympy.nsimplify for final forms).
+- Check each result in code by substituting it back into the original
+  equation(s).
+- Base every answer on the code's output, never on mental arithmetic.
+- Finally, return ONLY the JSON object described above.
 """
 
 # ============================================================
@@ -547,6 +777,245 @@ def normalize_json_text(text: str) -> str:
     return ""
 
 
+# ============================================================
+# LOCAL MATHS (see LOCAL_MATH)
+# ============================================================
+# A tiny calculator for the formulas the AI writes in "calc". It does NOT
+# run the formula as Python: it reads the formula's structure and only
+# understands numbers, + - * / ** ( ), pi, e and the functions listed below.
+# Anything else (names, attributes, strings, imports...) makes it give up,
+# and the AI's own answer is used instead.
+import ast
+from decimal import Decimal, ROUND_HALF_UP, localcontext
+from fractions import Fraction
+
+_CALC_MAX_CHARS = 300
+_CALC_MAX_NODES = 200
+_CALC_MAX_INT_EXP = 1000
+
+
+class CalcError(Exception):
+    pass
+
+
+def _f(v):
+    return float(v)
+
+
+def _real_root(x, n):
+    x, n = float(x), float(n)
+    if n == 0:
+        raise CalcError("0th root")
+    if x < 0:
+        if n != int(n) or int(n) % 2 == 0:
+            raise CalcError("even root of a negative number")
+        return -((-x) ** (1.0 / n))
+    return x ** (1.0 / n)
+
+
+def _log(x, base=None):
+    if base is None:
+        return math.log(_f(x))
+    return math.log(_f(x)) / math.log(_f(base))
+
+
+def _int_arg(v, limit):
+    if isinstance(v, float):
+        if v != int(v):
+            raise CalcError("needs a whole number")
+        v = Fraction(int(v))
+    if v.denominator != 1 or abs(v.numerator) > limit:
+        raise CalcError("needs a small whole number")
+    return int(v.numerator)
+
+
+def _sqrt(x):
+    if isinstance(x, Fraction) and x >= 0:
+        n, d = math.isqrt(x.numerator), math.isqrt(x.denominator)
+        if n * n == x.numerator and d * d == x.denominator:
+            return Fraction(n, d)  # exact: sqrt(9/4) = 3/2
+    return math.sqrt(_f(x))
+
+
+_CALC_FUNCS = {
+    "exp": lambda x: math.exp(_f(x)),
+    "ln": lambda x: math.log(_f(x)),
+    "log": _log,
+    "log10": lambda x: math.log10(_f(x)),
+    "log2": lambda x: math.log2(_f(x)),
+    "sqrt": _sqrt,
+    "cbrt": lambda x: _real_root(x, 3),
+    "root": _real_root,
+    "abs": abs,
+    "floor": lambda x: Fraction(math.floor(x)),
+    "ceil": lambda x: Fraction(math.ceil(x)),
+    "factorial": lambda n: Fraction(math.factorial(_int_arg(n, 170))),
+    "comb": lambda n, k: Fraction(math.comb(_int_arg(n, 1000), _int_arg(k, 1000))),
+    "perm": lambda n, k: Fraction(math.perm(_int_arg(n, 1000), _int_arg(k, 1000))),
+    "sin": lambda x: math.sin(_f(x)),
+    "cos": lambda x: math.cos(_f(x)),
+    "tan": lambda x: math.tan(_f(x)),
+    "asin": lambda x: math.asin(_f(x)),
+    "acos": lambda x: math.acos(_f(x)),
+    "atan": lambda x: math.atan(_f(x)),
+    "sind": lambda x: math.sin(math.radians(_f(x))),
+    "cosd": lambda x: math.cos(math.radians(_f(x))),
+    "tand": lambda x: math.tan(math.radians(_f(x))),
+    "asind": lambda x: math.degrees(math.asin(_f(x))),
+    "acosd": lambda x: math.degrees(math.acos(_f(x))),
+    "atand": lambda x: math.degrees(math.atan(_f(x))),
+}
+_CALC_CONSTS = {"pi": math.pi, "e": math.e}
+
+
+def _calc_node(node):
+    if isinstance(node, ast.Expression):
+        return _calc_node(node.body)
+    if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+        # Exact: 3.42 is kept as 342/100, not the float 3.4199999...
+        return Fraction(repr(node.value)) if isinstance(node.value, float) else Fraction(node.value)
+    if isinstance(node, ast.Name) and node.id.lower() in _CALC_CONSTS:
+        return _CALC_CONSTS[node.id.lower()]
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        v = _calc_node(node.operand)
+        return -v if isinstance(node.op, ast.USub) else v
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow)):
+        a, b = _calc_node(node.left), _calc_node(node.right)
+        if isinstance(node.op, ast.Pow):
+            return _calc_pow(a, b)
+        exact = isinstance(a, Fraction) and isinstance(b, Fraction)
+        if not exact:
+            a, b = _f(a), _f(b)
+        if isinstance(node.op, ast.Add):
+            return a + b
+        if isinstance(node.op, ast.Sub):
+            return a - b
+        if isinstance(node.op, ast.Mult):
+            return a * b
+        if b == 0:
+            raise CalcError("division by zero")
+        return a / b
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id.lower() in _CALC_FUNCS
+        and not node.keywords
+        and 1 <= len(node.args) <= 2
+    ):
+        args = [_calc_node(a) for a in node.args]
+        return _CALC_FUNCS[node.func.id.lower()](*args)
+    raise CalcError(f"not allowed: {type(node).__name__}")
+
+
+def _calc_pow(a, b):
+    if isinstance(b, Fraction) and b.denominator == 1 and isinstance(a, Fraction):
+        if abs(b.numerator) > _CALC_MAX_INT_EXP:
+            raise CalcError("exponent too large")
+        if a == 0 and b < 0:
+            raise CalcError("division by zero")
+        return a ** b.numerator  # exact
+    fa, fb = _f(a), _f(b)
+    if fa < 0:
+        # Real odd roots of negatives, e.g. (-8)^(1/3) = -2.
+        if isinstance(b, Fraction) and b.denominator % 2 == 1:
+            return -((-fa) ** fb) if b.numerator % 2 else (-fa) ** fb
+        if fb == int(fb):
+            return math.pow(fa, fb)
+        raise CalcError("negative number to a fractional power")
+    try:
+        return math.pow(fa, fb)
+    except OverflowError:
+        raise CalcError("too large")
+
+
+def evaluate_calc(expr: str):
+    """Value of a maths formula as an exact Fraction or a float.
+    Raises CalcError (or ValueError etc.) if it isn't plain, valid maths."""
+    if not isinstance(expr, str) or not expr.strip() or len(expr) > _CALC_MAX_CHARS:
+        raise CalcError("empty or too long")
+    text = expr.strip().replace("^", "**").replace("\u2212", "-").replace("\u00d7", "*").replace("\u00f7", "/")
+    tree = ast.parse(text, mode="eval")
+    if sum(1 for _ in ast.walk(tree)) > _CALC_MAX_NODES:
+        raise CalcError("too long")
+    value = _calc_node(tree)
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        raise CalcError("not a finite number")
+    return value
+
+
+def _to_decimal(value) -> Decimal:
+    with localcontext() as ctx:
+        ctx.prec = 60
+        if isinstance(value, Fraction):
+            return Decimal(value.numerator) / Decimal(value.denominator)
+        return Decimal(repr(float(value)))
+
+
+_PLAIN_NUMBER = re.compile(r"^-?(\d{1,3}(,\d{3})+|\d+)?(\.\d+)?$")
+_PLAIN_FRACTION = re.compile(r"^-?\d+/\d+$")
+
+
+def format_calc(value, round_to, ai_answer: str):
+    """The locally computed value written the way it should be typed, or
+    None if it can't be written safely in a form the question wants."""
+    ai = (ai_answer or "").strip().replace(" ", "").replace("\u2212", "-")
+    commas = "," in ai
+
+    def fixed(places):
+        with localcontext() as ctx:
+            ctx.prec = 60
+            q = _to_decimal(value).quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
+        if q == 0:
+            q = abs(q)  # no "-0.0000"
+        return format(q, ",f" if commas else "f")
+
+    if round_to is not None:
+        if not isinstance(round_to, int) or not 0 <= round_to <= 12:
+            return None
+        return fixed(round_to)
+
+    # No rounding asked for: exact answers only.
+    if isinstance(value, Fraction):
+        if value.denominator == 1:
+            return format(value.numerator, "," if commas else "d")
+        if _PLAIN_FRACTION.match(ai):
+            return f"{value.numerator}/{value.denominator}"
+        d = value.denominator
+        while d % 2 == 0:
+            d //= 2
+        while d % 5 == 0:
+            d //= 5
+        if d == 1:  # ends: 3/8 = 0.375
+            return format(_to_decimal(value).normalize(), ",f" if commas else "f")
+    # A non-terminating value with no rounding instruction: use as many
+    # decimal places as the AI itself wrote.
+    if _PLAIN_NUMBER.match(ai) and "." in ai:
+        return fixed(len(ai.split(".", 1)[1]))
+    return None
+
+
+def apply_local_math(task):
+    """If the task carries a formula, work it out here and use that as the
+    answer. Returns (task, note) - note is None when nothing changed."""
+    if not LOCAL_MATH or task.input_type != "type_text" or not task.calc:
+        return task, None
+    ai = task.answer.strip().replace(" ", "").replace("\u2212", "-")
+    if not (_PLAIN_NUMBER.match(ai) or _PLAIN_FRACTION.match(ai)) or ai in ("", "-", "."):
+        return task, None  # the answer isn't a plain number (an expression, text...)
+    try:
+        value = evaluate_calc(task.calc)
+        local = format_calc(value, task.round_to, task.answer)
+    except Exception as e:
+        return task, f"could not compute {task.calc!r} ({e}) - keeping the AI's {task.answer!r}"
+    if local is None:
+        return task, None
+    if local == task.answer.strip():
+        return task, f"{task.calc} = {local} (AI agrees)"
+    return task.model_copy(update={"answer": local}), (
+        f"{task.calc} = {local} - AI had {task.answer!r}, using {local!r}"
+    )
+
+
 def task_from_dict(raw) -> Optional[Task]:
     if not isinstance(raw, dict):
         return None
@@ -565,6 +1034,25 @@ def task_from_dict(raw) -> Optional[Task]:
         return None
 
     bbox = raw.get("bbox", raw.get("bounding_box", raw.get("box")))
+
+    # Gemini's native format: box_2d = [ymin, xmin, ymax, xmax].
+    box_2d = raw.get("box_2d")
+    if bbox is None and isinstance(box_2d, (list, tuple)) and len(box_2d) == 4:
+        try:
+            ymin, xmin, ymax, xmax = (max(0, min(1000, int(float(v)))) for v in box_2d)
+        except (TypeError, ValueError):
+            return None
+        ymin, ymax = sorted((ymin, ymax))
+        xmin, xmax = sorted((xmin, xmax))
+        # A box squashed to a line/point (common for tiny controls) is
+        # widened by 1 unit so its centre is still usable.
+        if xmax == xmin:
+            xmax = min(1000, xmin + 1)
+            xmin = xmax - 1
+        if ymax == ymin:
+            ymax = min(1000, ymin + 1)
+            ymin = ymax - 1
+        bbox = {"x1": xmin, "y1": ymin, "x2": xmax, "y2": ymax}
 
     if bbox is None and all(k in raw for k in ("x", "y", "width", "height")):
         bbox = {
@@ -607,6 +1095,13 @@ def task_from_dict(raw) -> Optional[Task]:
 
     part = clean_text(raw.get("part", raw.get("field", raw.get("label", "")))) or None
 
+    calc = clean_text(raw.get("calc", "")) or None
+    round_to = raw.get("round_to")
+    try:
+        round_to = int(round_to) if round_to is not None and str(round_to).strip() != "" else None
+    except (TypeError, ValueError):
+        round_to = None
+
     return Task(
         question_id=clean_text(qid) or "unknown",
         question=question,
@@ -615,7 +1110,43 @@ def task_from_dict(raw) -> Optional[Task]:
         bbox=bbox_obj,
         option=option,
         part=part,
+        calc=calc if input_type == "type_text" else None,
+        round_to=round_to if input_type == "type_text" else None,
     )
+
+
+def _label_text(text) -> str:
+    return _WS.sub(" ", (text or "").strip().lower()).strip(" .:!?")
+
+
+def blocked_label(task) -> Optional[str]:
+    """The label of a click_option task that matches NEVER_CLICK_LABELS,
+    else None. Whole-label matches only, so a real option that merely
+    mentions a word (e.g. "Check the answer is positive") isn't blocked."""
+    if task.input_type != "click_option":
+        return None
+    for raw in (task.option, task.answer):
+        label = _label_text(raw)
+        if not label:
+            continue
+        for pattern in NEVER_CLICK_LABELS:
+            try:
+                if re.fullmatch(pattern, label, re.I):
+                    return (raw or "").strip()
+            except re.error:
+                continue
+    return None
+
+
+def in_never_click_zone(x, y) -> bool:
+    for zone in NEVER_CLICK_ZONES:
+        try:
+            l, t, r, b = zone
+            if l <= x <= r and t <= y <= b:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
 
 
 def normalize_solver_json(data) -> SolverResponse:
@@ -663,7 +1194,18 @@ def normalize_solver_json(data) -> SolverResponse:
         if key in seen:
             continue
 
+        blocked = blocked_label(task)
+        if blocked:
+            print(
+                f"[BLOCKED] Ignoring the AI's click on {blocked!r} - it's navigation, "
+                f"not an answer (NEVER_CLICK_LABELS)."
+            )
+            continue
+
         seen.add(key)
+        task, note = apply_local_math(task)
+        if note:
+            print(f"[MATH] Q{task.question_id}{' ' + task.part if task.part else ''}: {note}")
         tasks.append(task)
 
     return SolverResponse(tasks=tasks)
@@ -758,7 +1300,7 @@ def pick_gemini_model():
     being True is normal and expected - use enabled_gemini_models() there
     instead, and this function stays quiet about it."""
     enabled = enabled_gemini_models()
-    if len(enabled) > 1 and not GEMINI_CONSULT:
+    if len(enabled) > 1 and not GEMINI_CONSULT and not USE_GEMINI_FLASH_CYCLE:
         print(f"[Gemini] WARNING: {len(enabled)} models set to True; using {enabled[0]}.")
     return enabled[0] if enabled else None
 
@@ -774,24 +1316,41 @@ def _is_rate_limit_error(e: Exception) -> bool:
     )
 
 
-def call_gemini_model(model: str, image_b64: str, mime: str):
-    """One request to a SPECIFIC Gemini model. Returns a SolverResponse or
-    None. Shared by the normal single-model path and the flash-race path."""
-    if gemini_client is None:
-        print("[Gemini] No API key configured.")
-        return None
+# Models that rejected GEMINI_IMAGE_DETAIL this run (asked once, then skipped).
+_no_image_detail = set()
 
-    start = time.perf_counter()
 
-    try:
-        print(f"[Gemini:{model}] Sending request...")
+def _looks_like_detail_rejection(e: Exception) -> bool:
+    msg = str(e).lower()
+    return "resolution" in msg and any(
+        m in msg for m in ("400", "invalid", "unsupported", "not supported")
+    )
 
-        interaction = gemini_client.interactions.create(
+
+# Models that rejected code execution this run (asked once, then skipped).
+_no_code_execution = set()
+
+
+def _looks_like_tool_rejection(e: Exception) -> bool:
+    msg = str(e).lower()
+    return any(m in msg for m in ("code_execution", "code execution", "tool")) and any(
+        m in msg for m in ("400", "invalid", "unsupported", "not supported", "not enabled")
+    )
+
+
+def _create_interaction(model: str, image_b64: str, mime: str):
+    image_part = {"type": "image", "data": image_b64, "mime_type": mime}
+    use_detail = bool(GEMINI_IMAGE_DETAIL) and model not in _no_image_detail
+    use_code = GEMINI_CODE_EXECUTION and model not in _no_code_execution
+
+    def send():
+        part = dict(image_part)
+        if use_detail:
+            part["resolution"] = GEMINI_IMAGE_DETAIL
+        prompt = SOLVER_PROMPT + (CODE_EXECUTION_PROMPT if use_code else "")
+        kwargs = dict(
             model=model,
-            input=[
-                {"type": "text", "text": SOLVER_PROMPT},
-                {"type": "image", "data": image_b64, "mime_type": mime},
-            ],
+            input=[{"type": "text", "text": prompt}, part],
             generation_config={"thinking_level": GEMINI_THINKING},
             response_format={
                 "type": "text",
@@ -799,21 +1358,359 @@ def call_gemini_model(model: str, image_b64: str, mime: str):
                 "schema": SOLVER_SCHEMA,
             },
         )
+        if use_code:
+            kwargs["tools"] = [{"type": "code_execution"}]
+        return gemini_client.interactions.create(**kwargs)
 
-        result = parse_solver_text(interaction.output_text or "")
+    # At most one retry per optional feature the model turns out not to
+    # support; any other error is raised as normal.
+    for _ in range(3):
+        try:
+            return send()
+        except Exception as e:
+            if use_detail and _looks_like_detail_rejection(e):
+                use_detail = False
+                _no_image_detail.add(model)
+                print(
+                    f"[Gemini:{model}] Doesn't accept image detail "
+                    f"'{GEMINI_IMAGE_DETAIL}' - using the default detail from now on."
+                )
+            elif use_code and _looks_like_tool_rejection(e):
+                use_code = False
+                _no_code_execution.add(model)
+                print(
+                    f"[Gemini:{model}] Doesn't support code execution - "
+                    f"answering without it from now on."
+                )
+            else:
+                raise
+            count_request(model)
+    return send()
 
-        print(
-            f"[Gemini:{model}] Found {len(result.tasks)} question(s) "
-            f"in {time.perf_counter() - start:.2f}s."
-        )
-        return result
 
+def _final_json_text(interaction) -> str:
+    """With code execution on, a reply is a series of steps (the model's
+    notes, its code, the code's output, ...) and only the LAST text is the
+    JSON answer. Try the text blocks from last to first, then the whole
+    output_text as before."""
+    texts = []
+    for step in getattr(interaction, "steps", None) or []:
+        if getattr(step, "type", None) != "model_output":
+            continue
+        for block in getattr(step, "content", None) or []:
+            if getattr(block, "type", None) == "text" and getattr(block, "text", None):
+                texts.append(block.text)
+    for text in reversed(texts):
+        if normalize_json_text(text):
+            return text
+    return getattr(interaction, "output_text", None) or ""
+
+
+def _code_runs(interaction) -> int:
+    return sum(
+        1 for step in (getattr(interaction, "steps", None) or [])
+        if getattr(step, "type", None) == "code_execution_call"
+    )
+
+
+def request_gemini(model: str, image_b64: str, mime: str):
+    """One request to a SPECIFIC Gemini model. Returns a SolverResponse and
+    RAISES on any failure (network, quota, unusable answer)."""
+    start = time.perf_counter()
+    print(f"[Gemini:{model}] Sending request...")
+    count_request(model)
+    interaction = _create_interaction(model, image_b64, mime)
+    result = parse_solver_text(_final_json_text(interaction))
+    runs = _code_runs(interaction)
+    ran = f", ran Python {runs}x" if runs else ""
+    print(
+        f"[Gemini:{model}] Found {len(result.tasks)} question(s) "
+        f"in {time.perf_counter() - start:.2f}s{ran}."
+    )
+    return result
+
+
+def call_gemini_model(model: str, image_b64: str, mime: str):
+    """Like request_gemini, but prints the error and returns None instead of
+    raising. Used by plain, race and consult mode."""
+    if gemini_client is None:
+        print("[Gemini] No API key - put your real key in .env as GEMINI_API_KEY=...")
+        return None
+
+    start = time.perf_counter()
+    try:
+        return request_gemini(model, image_b64, mime)
     except Exception as e:
         print(f"[Gemini:{model}] ERROR: {e}")
         print(f"[Gemini:{model}] Failed after {time.perf_counter() - start:.2f}s.")
         if _is_rate_limit_error(e):
             print(f"  -> Rate limit / quota reached for {model}.")
         return None
+
+
+# ============================================================
+# FLASH CYCLE (see USE_GEMINI_FLASH_CYCLE)
+# ============================================================
+# model -> epoch time until which it is skipped. Saved (with how many
+# requests this program sent each model today) to a small file in the temp
+# folder, so a restart doesn't re-ask models that really are used up.
+_CYCLE_STATE_FILE = os.path.join(tempfile.gettempdir(), "ai_solver_flash_cycle.json")
+_cycle_blocked = {}
+_cycle_sent = {}       # model -> requests this program sent it since the last daily reset
+_cycle_sent_reset = 0.0  # when _cycle_sent was last cleared (epoch of the reset it counts toward)
+_cycle_strikes = {}    # model -> (unclear quota errors in a row, time of the last one)
+_cycle_current = None  # last model that answered (for the "switched" message)
+_STRIKE_PAUSES = (60, 120, 300, 900)  # growing pause for UNCLEAR quota errors
+_STRIKE_FORGET_SECONDS = 1800         # a streak older than this starts over
+
+
+def _next_daily_reset() -> float:
+    """Epoch time of the next midnight Pacific time (when Google resets the
+    free daily limits). Uses the real Pacific time zone when Python has it;
+    otherwise assumes UTC-8, which at worst brings models back an hour late
+    in summer."""
+    now = time.time()
+    try:
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        pacific = ZoneInfo("America/Los_Angeles")
+        local = datetime.fromtimestamp(now, pacific)
+        midnight = (local + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return midnight.timestamp()
+    except Exception:
+        day = 86400
+        shifted = now - 8 * 3600
+        return (shifted // day + 1) * day + 8 * 3600
+
+
+def _roll_sent_counts():
+    """Start today's request counts from zero after each daily reset."""
+    global _cycle_sent_reset
+    reset = _next_daily_reset()
+    if _cycle_sent_reset != reset:
+        _cycle_sent.clear()
+        _cycle_sent_reset = reset
+
+
+def count_request(model: str):
+    """Called once per request actually sent to Gemini."""
+    _roll_sent_counts()
+    _cycle_sent[model] = _cycle_sent.get(model, 0) + 1
+    if USE_GEMINI_FLASH_CYCLE:
+        _save_cycle_state()
+
+
+def _load_cycle_state():
+    global _cycle_sent_reset
+    try:
+        with open(_CYCLE_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return  # no file yet / unreadable -> start fresh
+    if not isinstance(data, dict):
+        return
+    blocked = data.get("blocked", {}) if "blocked" in data else data  # older format
+    now = time.time()
+    for model, until in blocked.items():
+        if isinstance(until, (int, float)) and until > now:
+            _cycle_blocked[model] = float(until)
+    if data.get("sent_reset") == _next_daily_reset() and isinstance(data.get("sent"), dict):
+        _cycle_sent.update({m: int(n) for m, n in data["sent"].items()})
+        _cycle_sent_reset = data["sent_reset"]
+
+
+def _save_cycle_state():
+    try:
+        now = time.time()
+        data = {
+            "blocked": {m: u for m, u in _cycle_blocked.items() if u > now and u != float("inf")},
+            "sent": _cycle_sent,
+            "sent_reset": _cycle_sent_reset,
+        }
+        with open(_CYCLE_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def forget_cycle_state():
+    """Clear every remembered 'used up' model (RESET_FLASH_CYCLE_ON_START)."""
+    _cycle_blocked.clear()
+    _cycle_strikes.clear()
+    try:
+        os.remove(_CYCLE_STATE_FILE)
+    except OSError:
+        pass
+
+
+def _reset_time_text(until: float) -> str:
+    return time.strftime("%H:%M", time.localtime(until))
+
+
+def _retry_delay_seconds(msg: str) -> float:
+    m = re.search(r"retry in ([0-9.]+)\s*s", msg, re.I) or re.search(
+        r"retryDelay['\"]?\s*[:=]\s*['\"]?([0-9.]+)s", msg
+    )
+    try:
+        return min(300.0, max(5.0, float(m.group(1)))) if m else 60.0
+    except ValueError:
+        return 60.0
+
+
+_QUOTA_ID = re.compile(r"quotaId['\"]?\s*[:=]\s*['\"]?([A-Za-z0-9_\-]+)")
+_QUOTA_LIMIT = re.compile(r"limit:\s*(\d+)")
+
+
+def describe_quota_error(msg: str):
+    """What Google's 429 actually says: (quota_ids, limits, per_day, per_minute)."""
+    ids = _QUOTA_ID.findall(msg)
+    limits = [int(n) for n in _QUOTA_LIMIT.findall(msg)]
+    if ids:
+        per_day = any("perday" in q.lower() for q in ids)
+        per_minute = any("perminute" in q.lower() for q in ids)
+    else:
+        low = msg.lower()
+        per_day = "perday" in low or "per day" in low
+        per_minute = "perminute" in low or "per minute" in low
+    return ids, limits, per_day, per_minute
+
+
+def _cycle_handle_quota(model: str, msg: str) -> str:
+    """Decide what a quota (429) error means for this model and return a
+    description for the log. A model is only written off until the daily
+    reset when GOOGLE SAYS its daily limit is used up. Per-minute and unclear
+    errors only pause it for a while."""
+    ids, limits, per_day, per_minute = describe_quota_error(msg)
+    _roll_sent_counts()
+    sent = _cycle_sent.get(model, 0)
+    google_said = f"Google: {', '.join(ids)}" if ids else "Google gave no quota name"
+    if limits:
+        google_said += f", limit {'/'.join(str(n) for n in limits)}"
+
+    if 0 in limits and not per_minute:
+        _cycle_blocked[model] = _next_daily_reset()
+        _save_cycle_state()
+        return (
+            f"not available on your free tier ({google_said}). "
+            f"Skipped until {_reset_time_text(_cycle_blocked[model])}"
+        )
+
+    if per_day and not per_minute:
+        _cycle_blocked[model] = _next_daily_reset()
+        _cycle_strikes.pop(model, None)
+        _save_cycle_state()
+        text = (
+            f"DAILY limit used up ({google_said}). This program sent it "
+            f"{sent} request(s) since the last reset. Back at "
+            f"{_reset_time_text(_cycle_blocked[model])}"
+        )
+        day_limit = max(limits) if limits else 0
+        if day_limit and sent < day_limit:
+            text += (
+                f". NOTE: that's fewer than the {day_limit}/day limit - the rest "
+                f"came from something else on the same Google project, or it's "
+                f"a problem on Google's side"
+            )
+        return text
+
+    if per_minute:
+        wait = _retry_delay_seconds(msg)
+        _cycle_blocked[model] = time.time() + wait
+        return f"per-minute limit ({google_said}) - skipped for {wait:.0f}s, NOT used up"
+
+    # Unclear: pause, growing each time it happens again soon after.
+    count, last = _cycle_strikes.get(model, (0, 0.0))
+    if time.time() - last > _STRIKE_FORGET_SECONDS:
+        count = 0
+    count += 1
+    _cycle_strikes[model] = (count, time.time())
+    wait = max(_retry_delay_seconds(msg), _STRIKE_PAUSES[min(count, len(_STRIKE_PAUSES)) - 1])
+    _cycle_blocked[model] = time.time() + wait
+    return f"quota error Google didn't explain ({google_said}) - skipped for {wait / 60:.0f} min, NOT written off for the day"
+
+
+def _is_unavailable_error(e: Exception) -> bool:
+    code = getattr(e, "code", None) or getattr(e, "status_code", None)
+    msg = str(e).lower()
+    return code in (500, 502, 503, 504) or any(
+        m in msg for m in ("503", "unavailable", "overloaded", "internal error")
+    )
+
+
+def _is_unsupported_setting_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return "thinking" in msg and any(m in msg for m in ("400", "invalid", "not supported", "unsupported"))
+
+
+def cycle_order():
+    order = list(FLASH_CYCLE_MODELS)
+    if FLASH_CYCLE_FALLBACK and FLASH_CYCLE_FALLBACK not in order:
+        order.append(FLASH_CYCLE_FALLBACK)
+    return order
+
+
+def cycle_next_model():
+    """The model the next press will use (None = everything used up)."""
+    now = time.time()
+    for model in cycle_order():
+        if _cycle_blocked.get(model, 0) <= now:
+            return model
+    return None
+
+
+def call_gemini_flash_cycle(image_b64: str, mime: str):
+    """Use the first Flash model that isn't used up. If it turns out to be
+    used up (or overloaded) the SAME press moves straight on to the next."""
+    global _cycle_current
+
+    if gemini_client is None:
+        print("[Gemini] No API key - put your real key in .env as GEMINI_API_KEY=...")
+        return None
+
+    for model in cycle_order():
+        if _cycle_blocked.get(model, 0) > time.time():
+            continue
+        _cycle_blocked.pop(model, None)
+
+        if _cycle_current and model != _cycle_current:
+            print(f"[Flash Cycle] Switched to {model}.")
+
+        start = time.perf_counter()
+        try:
+            result = request_gemini(model, image_b64, mime)
+            _cycle_strikes.pop(model, None)
+            _cycle_current = model
+            return result
+
+        except Exception as e:
+            took = time.perf_counter() - start
+            msg = str(e)
+
+            if _is_rate_limit_error(e):
+                why = _cycle_handle_quota(model, msg)
+                print(f"[Flash Cycle] {model}: {why} ({took:.2f}s). Trying the next model...")
+                continue
+            if _is_unsupported_setting_error(e):
+                _cycle_blocked[model] = float("inf")  # this run only, not saved
+                print(
+                    f"[Flash Cycle] {model} rejected thinking level "
+                    f"'{GEMINI_THINKING}' - skipping it. Trying the next model..."
+                )
+                continue
+            if _is_unavailable_error(e):
+                print(f"[Flash Cycle] {model} is overloaded/unavailable right now. Trying the next model...")
+                continue
+
+            # Anything else (unusable answer, timeout, bad key): the press
+            # fails as usual; the same model is tried again next press.
+            print(f"[Gemini:{model}] ERROR: {e}")
+            print(f"[Gemini:{model}] Failed after {took:.2f}s.")
+            return None
+
+    upcoming = [u for u in _cycle_blocked.values() if u != float("inf")]
+    when = f" The first one comes back at {_reset_time_text(min(upcoming))}." if upcoming else ""
+    print(f"[Flash Cycle] Every model in the cycle is used up or unavailable.{when}")
+    return None
 
 
 def call_gemini_flash_race(image_b64: str, mime: str):
@@ -823,10 +1720,14 @@ def call_gemini_flash_race(image_b64: str, mime: str):
     finishes next instead of giving up immediately."""
     models = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
 
-    with ThreadPoolExecutor(max_workers=len(models)) as executor:
+    # NOT a "with" block: leaving a "with ThreadPoolExecutor" always waits
+    # for EVERY thread to finish, so the race used to be as slow as the
+    # SLOWER model. shutdown(wait=False) lets the loser finish in the
+    # background while we move on immediately.
+    executor = ThreadPoolExecutor(max_workers=len(models))
+    try:
         futures = {executor.submit(call_gemini_model, m, image_b64, mime): m for m in models}
 
-        winning_result = None
         for future in as_completed(futures):
             model = futures[future]
             try:
@@ -837,17 +1738,17 @@ def call_gemini_flash_race(image_b64: str, mime: str):
 
             if result:
                 print(f"[Gemini Race] {model} won.")
-                winning_result = result
-                break
+                return result
 
-        # Don't block on the loser; it's fine if it finishes in the
-        # background after we've already moved on.
+        return None
+    finally:
         executor.shutdown(wait=False, cancel_futures=True)
-
-        return winning_result
 
 
 def call_gemini(image_b64: str, mime: str):
+    if USE_GEMINI_FLASH_CYCLE:
+        return call_gemini_flash_cycle(image_b64, mime)
+
     if USE_GEMINI_FLASH_RACE:
         return call_gemini_flash_race(image_b64, mime)
 
@@ -879,7 +1780,10 @@ def call_openrouter(image_b64: str, mime: str, index: int):
                 {"type": "text", "text": SOLVER_PROMPT},
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:{mime};base64,{image_b64}"},
+                    "image_url": {
+                        "url": f"data:{mime};base64,{image_b64}",
+                        "detail": "high",  # full-detail vision where supported
+                    },
                 },
             ],
         }
@@ -926,19 +1830,19 @@ def call_openrouter(image_b64: str, mime: str, index: int):
 # CONSENSUS HELPERS
 # ============================================================
 def answer_key(task: Task) -> str:
-    return _WS.sub(" ", task.answer.lower()).strip()
-
-
-def question_text_key(task: Task) -> str:
-    return _WS.sub(" ", task.question.lower()).strip()
-
-
-def question_group_key(task: Task) -> str:
-    # input_type + part keep a question's click_option task and its various
-    # type_text blanks (x, y, z...) in separate consensus lanes, instead of
-    # one crowding out another as "disagreement" or merging distinct blanks.
-    part = (task.part or "").strip().lower()
-    return f"{question_text_key(task)}|{task.input_type}|{part}"
+    """An answer reduced to its VALUE for voting: case, spaces, a leading
+    "x =" and the kind of minus sign don't matter, and plain numbers are
+    compared as numbers ("0.5" == "1/2" == ".50")."""
+    text = _WS.sub("", (task.answer or "").lower())
+    text = text.replace("\u2212", "-").replace("\u2013", "-").rstrip(".")
+    text = re.sub(r"^[a-z][a-z0-9_]*=", "", text)
+    if re.fullmatch(r"-?(\d+\.?\d*|\.\d+)(/-?\d+)?", text):
+        try:
+            from fractions import Fraction
+            return str(Fraction(text))
+        except (ValueError, ZeroDivisionError):
+            pass
+    return text
 
 
 def _median(values):
@@ -963,41 +1867,133 @@ def merge_consensus_bbox(tasks: List[Task]) -> BoundingBox:
     )
 
 
-def _group_by_question(results):
-    groups = {}
+# The screenshot of the current press, so answers from different AIs can be
+# matched by WHERE their control is (set in capture_and_solve).
+_press_gray = None
+_press_size = (1000, 1000)
+_point_cache = {}
 
+
+def _task_point(task: Task):
+    """Screen point of a task's control: the snapped centre of the real
+    control when one is found, else the centre of the AI's box."""
+    key = id(task)
+    if key in _point_cache:
+        return _point_cache[key]
+    w, h = _press_size
+    x1, y1, x2, y2 = _task_pixels(task, w, h)
+    point = ((x1 + x2) / 2, (y1 + y2) / 2)
+    if _press_gray is not None and SNAP_TO_CONTROLS:
+        cands = _candidates(_press_gray, task)
+        if cands:
+            l, t, r, b = cands[0][1]
+            point = ((l + r) / 2, (t + b) / 2)
+    _point_cache[key] = point
+    return point
+
+
+def _cluster_tasks(results):
+    """Group every AI's tasks by the control they point at. Returns a list
+    of clusters: {"type": input_type, "entries": [(source, task), ...]}.
+    Each AI contributes at most one task per control."""
+    w, h = _press_size
+    clusters = []
     for source, result in results:
-        seen = set()
         for task in result.tasks:
-            qkey = question_group_key(task)
-            if not question_text_key(task) or qkey in seen:
-                continue
-            seen.add(qkey)
-            groups.setdefault(qkey, []).append((source, task))
+            pt = _task_point(task)
+            x1, y1, x2, y2 = _task_pixels(task, w, h)
+            tol = max(8.0, min(40.0, 0.5 * min(x2 - x1, y2 - y1)))
+            best = None
+            for c in clusters:
+                if c["type"] != task.input_type:
+                    continue
+                if any(src == source for src, _ in c["entries"]):
+                    continue
+                d = math.hypot(pt[0] - c["point"][0], pt[1] - c["point"][1])
+                if d <= max(tol, c["tol"]) and (best is None or d < best[0]):
+                    best = (d, c)
+            if best:
+                best[1]["entries"].append((source, task))
+            else:
+                clusters.append({
+                    "type": task.input_type, "point": pt, "tol": tol,
+                    "entries": [(source, task)],
+                })
+    return clusters
 
-    return groups
 
-
-def _best_answer_group(entries):
-    """Largest set of entries that agree on (answer, input_type)."""
-    answer_groups = {}
+def _answer_votes(entries):
+    """[(votes, [(source, task), ...]), ...] most votes first."""
+    groups = {}
     for source, task in entries:
-        key = (answer_key(task), task.input_type)
-        answer_groups.setdefault(key, []).append((source, task))
-    return max(answer_groups.values(), key=len)
+        groups.setdefault(answer_key(task), []).append((source, task))
+    return sorted(((len(g), g) for g in groups.values()), key=lambda v: -v[0])
+
+
+def _majority_qid(entries):
+    ids = [t.question_id for _, t in entries]
+    return max(set(ids), key=ids.count)
+
+
+def _decide(results):
+    """Voting. Returns a list of (cluster, winning_entries or None, reason)."""
+    clusters = _cluster_tasks(results)
+    decisions = []
+
+    # Text boxes: most common answer VALUE wins - if it has at least
+    # CONSENSUS_MIN votes AND more than any other answer (a tie = no fill).
+    for c in clusters:
+        if c["type"] != "type_text":
+            continue
+        votes = _answer_votes(c["entries"])
+        top, winners = votes[0]
+        runner_up = votes[1][0] if len(votes) > 1 else 0
+        if top >= CONSENSUS_MIN and top > runner_up:
+            decisions.append((c, winners, "ACCEPTED"))
+        elif top > runner_up:
+            decisions.append((c, None, "REJECTED (not enough agreement)"))
+        else:
+            decisions.append((c, None, "REJECTED (tie - the AIs disagree)"))
+
+    # Options: each vote is "click THIS one". For a radio question (every AI
+    # picked at most one option) only the clear winner is clicked; for a
+    # "select all that apply" question each option is judged on its own.
+    by_q = {}
+    for c in clusters:
+        if c["type"] == "click_option":
+            by_q.setdefault(_majority_qid(c["entries"]), []).append(c)
+    for qid, opts in by_q.items():
+        picks = {}
+        for c in opts:
+            for src, _ in c["entries"]:
+                picks[src] = picks.get(src, 0) + 1
+        multi_select = any(n > 1 for n in picks.values())
+        opts.sort(key=lambda c: -len(c["entries"]))
+        for i, c in enumerate(opts):
+            n = len(c["entries"])
+            if n < CONSENSUS_MIN:
+                decisions.append((c, None, "REJECTED (not enough agreement)"))
+            elif multi_select:
+                decisions.append((c, c["entries"], "ACCEPTED"))
+            elif i == 0 and (len(opts) == 1 or n > len(opts[1]["entries"])):
+                decisions.append((c, c["entries"], "ACCEPTED"))
+            elif i == 0:
+                decisions.append((c, None, "REJECTED (tie - the AIs picked different options)"))
+            else:
+                decisions.append((c, None, "REJECTED (another option got more votes)"))
+    return decisions
 
 
 def consensus_is_settled(results) -> bool:
-    """
-    True when at least one question exists AND every question seen so far
-    already has CONSENSUS_MIN agreeing AIs. Used to stop waiting early.
-    """
-    groups = _group_by_question(results)
-    if not groups:
+    """True when at least one control exists and EVERY control seen so far
+    already has an accepted answer - used to stop waiting for slower AIs.
+    (Losing options of a radio question don't count against it.)"""
+    decisions = _decide(results)
+    if not decisions:
         return False
     return all(
-        len(_best_answer_group(entries)) >= CONSENSUS_MIN
-        for entries in groups.values()
+        winners is not None or reason.startswith("REJECTED (another option")
+        for _, winners, reason in decisions
     )
 
 
@@ -1020,25 +2016,28 @@ def consensus_tasks(results):
     print("=" * 70)
 
     final_tasks = []
-
-    for entries in _group_by_question(results).values():
-        best = _best_answer_group(entries)
-        chosen = best[0][1]
-
-        print(f"\nQuestion {chosen.question_id}:")
-        print(f"  Answer:    {chosen.answer}")
-        print(f"  Type:      {chosen.input_type}")
-        print(f"  Agreement: {len(best)}/{len(results)}")
-        print("  Sources: " + ", ".join(source for source, _ in best))
-
-        if len(best) >= CONSENSUS_MIN:
-            chosen = chosen.model_copy(
-                update={"bbox": merge_consensus_bbox([t for _, t in best])}
-            )
-            print("  -> ACCEPTED")
-            final_tasks.append(chosen)
+    for cluster, winners, reason in _decide(results):
+        entries = cluster["entries"]
+        shown = winners or _answer_votes(entries)[0][1]
+        first = shown[0][1]
+        label = f"Question {first.question_id}" + (f" ({first.part})" if first.part else "")
+        if cluster["type"] == "click_option":
+            print(f"\n{label}: option '{first.option or first.answer}'")
+            print(f"  Votes:  {len(entries)}/{len(results)} ({', '.join(s for s, _ in entries)})")
         else:
-            print("  -> REJECTED (not enough agreement)")
+            print(f"\n{label}: box")
+            for n, group in _answer_votes(entries):
+                forms = [t.answer for _, t in group]
+                print(f"  {max(set(forms), key=forms.count)!r}: {n} vote(s) ({', '.join(s for s, _ in group)})")
+        print(f"  -> {reason}")
+
+        if winners:
+            forms = [t.answer for _, t in winners]
+            chosen = winners[0][1].model_copy(update={
+                "answer": max(set(forms), key=forms.count),  # most common way of writing it
+                "bbox": merge_consensus_bbox([t for _, t in winners]),
+            })
+            final_tasks.append(chosen)
 
     return sort_tasks(final_tasks)
 
@@ -1047,9 +2046,267 @@ def consensus_tasks(results):
 # UI ACTIONS
 # ============================================================
 def control_center(task: Task, width: int, height: int):
+    if task.click:
+        return int(task.click[0]), int(task.click[1])
     x = (task.bbox.x1 + task.bbox.x2) / 2.0 / 1000.0 * width
     y = (task.bbox.y1 + task.bbox.y2) / 2.0 / 1000.0 * height
     return int(x), int(y)
+
+
+# ============================================================
+# SNAP TO THE REAL CONTROL (see SNAP_TO_CONTROLS)
+# ============================================================
+# Works on a grayscale copy of the screenshot that was sent to the AI.
+# A control is found by starting from a "seed" pixel and walking outwards
+# while the colour stays the same (the empty inside of a box or circle); the
+# walk stops at the control's border. The result is only accepted if it
+# really looks like a box (4 straight, continuous borders) or a small
+# round/square option, so plain page background or text never qualifies.
+_SNAP_TOLERANCE = 24      # grey-level difference that counts as an edge
+_RECT_BORDER_MIN = 0.9    # share of each border side that must be an edge
+_OPTION_MIN_RADIUS = 4    # px - smaller "holes" are letters like o, e, a
+_OPTION_MAX_RADIUS = 30   # px
+
+
+class _Gray:
+    def __init__(self, image: Image.Image):
+        g = image if image.mode == "L" else image.convert("L")
+        self.w, self.h = g.size
+        self.buf = g.tobytes()
+
+    def px(self, x, y):
+        return self.buf[y * self.w + x]
+
+
+def _walk(g: _Gray, x, y, dx, dy, base, limit):
+    """Steps from (x, y) in direction (dx, dy) that stay the same colour as
+    base, or None if no edge is found within `limit` pixels / the screen."""
+    buf, w, h, tol = g.buf, g.w, g.h, _SNAP_TOLERANCE
+    for n in range(limit):
+        nx, ny = x + dx * (n + 1), y + dy * (n + 1)
+        if nx < 0 or ny < 0 or nx >= w or ny >= h:
+            return None
+        if abs(buf[ny * w + nx] - base) > tol:
+            return n
+    return None
+
+
+def _share_different(g: _Gray, points, base):
+    points = list(points)
+    if not points:
+        return 0.0
+    tol = _SNAP_TOLERANCE
+    return sum(1 for x, y in points if abs(g.px(x, y) - base) > tol) / len(points)
+
+
+def _share_same(g: _Gray, points, base):
+    points = list(points)
+    if not points:
+        return 0.0
+    tol = _SNAP_TOLERANCE
+    return sum(1 for x, y in points if abs(g.px(x, y) - base) <= tol) / len(points)
+
+
+def _find_box(g: _Gray, sx, sy, max_w, max_h):
+    """An empty text box around seed (sx, sy): (left, top, right, bottom)
+    of its inside, or None."""
+    base = g.px(sx, sy)
+    l = _walk(g, sx, sy, -1, 0, base, max_w)
+    r = _walk(g, sx, sy, 1, 0, base, max_w)
+    u = _walk(g, sx, sy, 0, -1, base, max_h)
+    d = _walk(g, sx, sy, 0, 1, base, max_h)
+    if None in (l, r, u, d):
+        return None
+    left, right, top, bottom = sx - l, sx + r, sy - u, sy + d
+    w, h = right - left + 1, bottom - top + 1
+    if w < 8 or h < 8 or w > max_w or h > max_h:
+        return None
+    if left < 1 or top < 1 or right >= g.w - 1 or bottom >= g.h - 1:
+        return None
+
+    # Check the middle 80% of each side (skips rounded corners).
+    xs = range(left + w // 10, right - w // 10 + 1)
+    ys = range(top + h // 10, bottom - h // 10 + 1)
+    borders = (
+        [(x, top - 1) for x in xs],
+        [(x, bottom + 1) for x in xs],
+        [(left - 1, y) for y in ys],
+        [(right + 1, y) for y in ys],
+    )
+    if any(_share_different(g, side, base) < _RECT_BORDER_MIN for side in borders):
+        return None
+    # ...and that the inside edges are clean (not text that happened to
+    # stop the walk).
+    insides = (
+        [(x, top) for x in xs],
+        [(x, bottom) for x in xs],
+        [(left, y) for y in ys],
+        [(right, y) for y in ys],
+    )
+    if any(_share_same(g, side, base) < _RECT_BORDER_MIN for side in insides):
+        return None
+    # ...and that the box is EMPTY all the way through. A box that already
+    # has an answer in it must never be snapped to: Ctrl+A would replace
+    # that answer. The only mark allowed inside is a text caret: one thin,
+    # tall vertical line.
+    marks = [
+        (x, y)
+        for y in range(top + 1, bottom, 2)
+        for x in range(left + 1, right)
+        if abs(g.px(x, y) - base) > _SNAP_TOLERANCE
+    ]
+    if marks:
+        mxs = [x for x, _ in marks]
+        mys = [y for _, y in marks]
+        is_caret = max(mxs) - min(mxs) <= 2 and max(mys) - min(mys) >= 0.5 * h
+        if not is_caret:
+            return None
+    return (left, top, right, bottom)
+
+
+def _find_option(g: _Gray, sx, sy):
+    """An empty radio circle / checkbox around seed (sx, sy): its inside as
+    (left, top, right, bottom), or None."""
+    base = g.px(sx, sy)
+    lim = _OPTION_MAX_RADIUS
+    axis = [_walk(g, sx, sy, dx, dy, base, lim) for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))]
+    diag = [_walk(g, sx, sy, dx, dy, base, lim) for dx, dy in ((-1, -1), (1, -1), (-1, 1), (1, 1))]
+    if None in axis or None in diag:
+        return None
+    l, r, u, d = axis
+    rx, ry = (l + r + 1) / 2, (u + d + 1) / 2          # radii through the centre
+    if min(rx, ry) < _OPTION_MIN_RADIUS or max(rx, ry) > _OPTION_MAX_RADIUS:
+        return None
+    if max(rx, ry) / min(rx, ry) > 1.35:               # must be round / square
+        return None
+    # Diagonals: circle ~ same as the radius, square ~ 1.41x. Anything far
+    # outside that (a gap in the border, a letter) is rejected.
+    radius = (rx + ry) / 2
+    for dist in diag:
+        if dist is None or not (0.45 * radius <= (dist + 1) * 1.414 <= 1.9 * radius):
+            return None
+    return (sx - l, sy - u, sx + r, sy + d)
+
+
+def _task_pixels(task: Task, width: int, height: int):
+    x1 = task.bbox.x1 / 1000 * width
+    x2 = task.bbox.x2 / 1000 * width
+    y1 = task.bbox.y1 / 1000 * height
+    y2 = task.bbox.y2 / 1000 * height
+    return x1, y1, x2, y2
+
+
+def _candidates(g: _Gray, task: Task):
+    """Every real control near the AI's box, nearest first:
+    list of (distance_px, (left, top, right, bottom))."""
+    x1, y1, x2, y2 = _task_pixels(task, g.w, g.h)
+    pw, ph = max(1.0, x2 - x1), max(1.0, y2 - y1)
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    is_option = task.input_type == "click_option"
+
+    if is_option:
+        margin = max(16.0, min(60.0, 1.0 * max(pw, ph)))
+        find = lambda sx, sy: _find_option(g, sx, sy)
+    else:
+        margin = max(8.0, min(60.0, 0.5 * max(pw, ph)))
+        max_w = int(max(3 * pw, pw + 80))
+        max_h = int(max(3 * ph, ph + 50))
+        min_w, min_h = max(8.0, 0.3 * pw), max(8.0, 0.3 * ph)
+
+        def find(sx, sy):
+            rect = _find_box(g, sx, sy, max_w, max_h)
+            if rect is None:
+                return None
+            w, h = rect[2] - rect[0] + 1, rect[3] - rect[1] + 1
+            return rect if (w >= min_w and h >= min_h) else None
+
+    rx1, ry1 = max(0, int(x1 - margin)), max(0, int(y1 - margin))
+    rx2, ry2 = min(g.w - 1, int(x2 + margin)), min(g.h - 1, int(y2 + margin))
+
+    # Seeds: the AI's centre first, then a grid over the search area.
+    seeds = [(min(g.w - 1, max(0, int(cx))), min(g.h - 1, max(0, int(cy))))]
+    step = max(3, int(min(pw, ph, 3 * margin) / 3))
+    seeds += [(x, y) for y in range(ry1, ry2 + 1, step) for x in range(rx1, rx2 + 1, step)]
+
+    found = {}
+    for sx, sy in seeds:
+        if any(l <= sx <= r and t <= sy <= b for l, t, r, b in found):
+            continue  # already inside a control we found
+        rect = find(sx, sy)
+        if rect is not None and rect not in found:
+            mx, my = (rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2
+            found[rect] = math.hypot(mx - cx, my - cy)
+        if found and (sx, sy) == seeds[0]:
+            break  # the AI's own centre is inside a real control: done
+
+    return sorted((dist, rect) for rect, dist in found.items())
+
+
+def snap_tasks(tasks: List[Task], screenshot: Image.Image):
+    """Returns (tasks, deferred). Tasks come back with `click` set to the
+    exact centre of the real control when one was found. With
+    PREVENT_SAME_BOX, a text answer that would share a box with another is
+    moved to `deferred` (done on the next press) instead of overwriting it."""
+    if not tasks:
+        return tasks, []
+
+    g = _Gray(screenshot) if SNAP_TO_CONTROLS else None
+    width, height = screenshot.size
+
+    cands = {i: (_candidates(g, t) if g is not None else []) for i, t in enumerate(tasks)}
+
+    # Hand out controls nearest-first; a text box goes to one answer only.
+    assigned, taken = {}, set()
+    pairs = sorted(
+        (dist, i, rect) for i, lst in cands.items() for dist, rect in lst
+    )
+    for dist, i, rect in pairs:
+        if i in assigned:
+            continue
+        is_text = tasks[i].input_type == "type_text"
+        if is_text and PREVENT_SAME_BOX and rect in taken:
+            continue
+        assigned[i] = rect
+        if is_text:
+            taken.add(rect)
+
+    out, deferred, used_points = [], [], []
+    for i, task in enumerate(tasks):
+        rect = assigned.get(i)
+        if rect is not None:
+            click = [round((rect[0] + rect[2]) / 2), round((rect[1] + rect[3]) / 2)]
+        else:
+            click = list(control_center(task, width, height))
+
+        if task.input_type == "type_text" and PREVENT_SAME_BOX:
+            inside_taken = rect is None and any(
+                l <= click[0] <= r and t <= click[1] <= b for l, t, r, b in taken
+            )
+            too_close = any(math.hypot(click[0] - px, click[1] - py) < 6 for px, py in used_points)
+            if inside_taken or too_close:
+                print(
+                    f"[SNAP] Q{task.question_id} part {task.part}: would land in a box "
+                    f"another answer is using - leaving it for the next press."
+                )
+                deferred.append(task)
+                continue
+            used_points.append(tuple(click))
+
+        if SNAP_TO_CONTROLS:
+            ax, ay = control_center(task, width, height)
+            if rect is not None:
+                print(
+                    f"[SNAP] Q{task.question_id} {task.part or task.input_type}: "
+                    f"found the control, moved {click[0] - ax:+d},{click[1] - ay:+d} px"
+                )
+            else:
+                print(
+                    f"[SNAP] Q{task.question_id} {task.part or task.input_type}: "
+                    f"no clear control found - using the AI's position"
+                )
+        out.append(task.model_copy(update={"click": click}))
+
+    return out, deferred
 
 
 def copy_to_clipboard(text: str) -> bool:
@@ -1077,6 +2334,7 @@ def copy_to_clipboard(text: str) -> bool:
 
 def perform_task(task: Task, width: int, height: int):
     x, y = control_center(task, width, height)
+    _clicked_points.append((x, y))
 
     print("\n" + "-" * 60)
     print(f"Question: {task.question}")
@@ -1100,6 +2358,10 @@ def perform_task(task: Task, width: int, height: int):
             pyautogui.click(x, y)  # reinforcement, not a native double-click
 
     else:  # type_text
+        # Clipboard first: copy_to_clipboard reads it back to confirm the
+        # text really landed, so it's ready before we even reach the box
+        # (Ctrl+A / clicks don't touch the clipboard).
+        copy_to_clipboard(task.answer)
         pyautogui.moveTo(x, y, duration=MOVE_DURATION_SECONDS)  # real glide, not a teleport
         pyautogui.click(x, y)
 
@@ -1113,16 +2375,11 @@ def perform_task(task: Task, width: int, height: int):
         time.sleep(CLICK_SETTLE_SECONDS)
         pyautogui.hotkey("ctrl", "a")
         time.sleep(CLIPBOARD_SETTLE_SECONDS)  # let select-all register first
-        copy_to_clipboard(task.answer)
-        time.sleep(CLIPBOARD_SETTLE_SECONDS)  # let the clipboard write commit
         pyautogui.hotkey("ctrl", "v")
 
 
-def build_chime_wav(notes_hz=None, notes_ms=None) -> bytes:
-    """Synthesize a soft chime (one bell-like tone per note) as an
-    in-memory WAV - no sound files needed."""
-    notes_hz = notes_hz or PING_NOTES_HZ
-    notes_ms = notes_ms or PING_NOTE_MS
+def build_tone_wav(notes_hz, notes_ms, volume) -> bytes:
+    """Synthesize a short run of soft bell-like notes as an in-memory WAV."""
     rate = 44100
     samples = []
 
@@ -1138,7 +2395,7 @@ def build_chime_wav(notes_hz=None, notes_ms=None) -> bytes:
 
     samples.extend([0.0] * int(rate * 0.03))  # tiny tail of silence
 
-    peak = 32767 * max(0.0, min(1.0, PING_VOLUME))
+    peak = 32767 * max(0.0, min(1.0, volume))
     frames = b"".join(struct.pack("<h", int(v * peak)) for v in samples)
 
     buf = io.BytesIO()
@@ -1150,32 +2407,55 @@ def build_chime_wav(notes_hz=None, notes_ms=None) -> bytes:
     return buf.getvalue()
 
 
-_sound_cache = {}      # "done"/"error" -> WAV bytes
-_sound_file_cache = {}  # "done"/"error" -> temp .wav path (Mac playback)
+def build_chime_wav() -> bytes:
+    return build_tone_wav(PING_NOTES_HZ, PING_NOTE_MS, PING_VOLUME)
 
 
-def _sound_wav(kind: str) -> bytes:
-    if kind not in _sound_cache:
-        if kind == "error":
-            _sound_cache[kind] = build_chime_wav(ERROR_NOTES_HZ, ERROR_NOTE_MS)
-        else:
-            _sound_cache[kind] = build_chime_wav(PING_NOTES_HZ, PING_NOTE_MS)
-    return _sound_cache[kind]
+def build_error_wav() -> bytes:
+    return build_tone_wav(ERROR_NOTES_HZ, ERROR_NOTE_MS, ERROR_VOLUME)
 
 
-def _sound_path(kind: str) -> str:
-    """Write the sound to a temp .wav once, for players that need a file."""
-    if kind not in _sound_file_cache:
-        fd, path = tempfile.mkstemp(prefix=f"solver_{kind}_", suffix=".wav")
-        with os.fdopen(fd, "wb") as f:
-            f.write(_sound_wav(kind))
-        _sound_file_cache[kind] = path
-    return _sound_file_cache[kind]
+_SOUND_BUILDERS = {"done": build_chime_wav, "error": build_error_wav}
+_sound_wavs = {}    # kind -> WAV bytes (built once)
+_sound_files = {}   # kind -> temp .wav path (Mac/Linux players need a file)
+
+
+def _sound_bytes(kind: str) -> bytes:
+    if kind not in _sound_wavs:
+        _sound_wavs[kind] = _SOUND_BUILDERS[kind]()
+    return _sound_wavs[kind]
+
+
+def _sound_file(kind: str) -> str:
+    """The sound as a .wav file on disk, written once per run."""
+    if kind == "done" and PING_SOUND_FILE and os.path.isfile(PING_SOUND_FILE):
+        return PING_SOUND_FILE
+    path = _sound_files.get(kind)
+    if path is None or not os.path.isfile(path):
+        path = os.path.join(tempfile.gettempdir(), f"ai_solver_{kind}.wav")
+        with open(path, "wb") as f:
+            f.write(_sound_bytes(kind))
+        _sound_files[kind] = path
+    return path
+
+
+def prepare_sounds():
+    """Build the sounds at startup so the first press doesn't pay for it."""
+    if not PLAY_SOUNDS:
+        return
+    try:
+        for kind in _SOUND_BUILDERS:
+            if winsound is not None:
+                _sound_bytes(kind)
+            else:
+                _sound_file(kind)
+    except Exception:
+        pass
 
 
 def play_sound(kind: str):
-    """Play the "done" chime or the "error" tone in the background so it
-    never delays anything. Silent when PLAY_SOUNDS is False."""
+    """kind = "done" (rising chime) or "error" (low falling tone).
+    Runs in the background so it never delays anything."""
     if not PLAY_SOUNDS:
         return
 
@@ -1187,12 +2467,25 @@ def play_sound(kind: str):
                 else:
                     # SND_MEMORY can't be combined with SND_ASYNC, so this
                     # blocks - fine, we're already in a background thread.
-                    winsound.PlaySound(_sound_wav(kind), winsound.SND_MEMORY)
-            elif sys.platform == "darwin":  # Mac: built-in afplay command
-                path = PING_SOUND_FILE if (kind == "done" and PING_SOUND_FILE and os.path.isfile(PING_SOUND_FILE)) else _sound_path(kind)
-                subprocess.run(["afplay", path], check=False)
+                    winsound.PlaySound(_sound_bytes(kind), winsound.SND_MEMORY)
+                return
+
+            player = None
+            if sys.platform == "darwin" and shutil.which("afplay"):
+                player = ["afplay"]
+            elif shutil.which("paplay"):
+                player = ["paplay"]
+            elif shutil.which("aplay"):
+                player = ["aplay", "-q"]
+
+            if player:
+                subprocess.Popen(
+                    player + [_sound_file(kind)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
             else:
-                print("\a", end="", flush=True)  # terminal bell (Linux)
+                print("\a", end="", flush=True)  # terminal bell as a last resort
         except Exception:
             pass  # no sound device / bad file -> silently skip
 
@@ -1200,12 +2493,10 @@ def play_sound(kind: str):
 
 
 def play_ping():
-    """Answers are filled in."""
     play_sound("done")
 
 
-def play_error_sound():
-    """The AI couldn't give a solution."""
+def play_error():
     play_sound("error")
 
 
@@ -1251,6 +2542,16 @@ def gather_parallel(executor, jobs):
     return results
 
 
+def consult_asks():
+    """[(label, model), ...] - every enabled model, GEMINI_CONSULT_REPEAT times."""
+    repeat = max(1, int(GEMINI_CONSULT_REPEAT))
+    asks = []
+    for m in enabled_gemini_models():
+        for i in range(1, repeat + 1):
+            asks.append((f"{m} #{i}" if repeat > 1 else m, m))
+    return asks
+
+
 def gather_results(image_b64: str, mime: str):
     """
     Launch AI calls in parallel and collect usable results.
@@ -1262,14 +2563,14 @@ def gather_results(image_b64: str, mime: str):
       stop waiting once every question already has agreement.
     """
     if GEMINI_ONLY and GEMINI_CONSULT:
-        models = enabled_gemini_models()
-        if len(models) < 2:
+        asks = consult_asks()
+        if len(asks) < 2:
             print(
-                f"[Gemini Consult] Only {len(models)} model(s) enabled; "
-                f"need at least 2 to consult."
+                f"[Gemini Consult] Only {len(asks)} answer(s) per press; need at "
+                f"least 2 - enable another model or raise GEMINI_CONSULT_REPEAT."
             )
-        executor = ThreadPoolExecutor(max_workers=max(1, len(models)))
-        jobs = {executor.submit(call_gemini_model, m, image_b64, mime): m for m in models}
+        executor = ThreadPoolExecutor(max_workers=max(1, len(asks)))
+        jobs = {executor.submit(call_gemini_model, m, image_b64, mime): label for label, m in asks}
         return gather_parallel(executor, jobs)
 
     if GEMINI_ONLY:
@@ -1309,39 +2610,67 @@ def print_final(final_tasks):
         print(f"INPUT TYPE: {task.input_type}")
         print(f"PART:       {task.part}")
         print(f"OPTION:     {task.option}")
+        if task.calc:
+            rounding = "exact" if task.round_to is None else f"{task.round_to} decimal places"
+            print(f"CALC:       {task.calc}  ({rounding})")
         print(
             f"BBOX:       {task.bbox.x1},{task.bbox.y1} -> "
             f"{task.bbox.x2},{task.bbox.y2}"
         )
 
 
-def select_text_tasks_to_perform(text_tasks):
-    """Which text boxes to fill THIS press. A blank that shares its
-    question_id with other blanks (a multi-part answer like x=_, y=_, z=_)
-    has real reflow risk - filling one can shift the others - so only the
-    FIRST one for that question is included; the rest wait for the next
-    press. A box that's the ONLY blank for its question is independent of
-    every other box on the page, so it's always included alongside every
-    other independent box - there's no reason to make those wait for each
-    other one at a time."""
-    if not ONE_TEXT_BOX_PER_PRESS:
-        return list(text_tasks), []
-
-    counts = {}
-    for t in text_tasks:
-        counts[t.question_id] = counts.get(t.question_id, 0) + 1
-
-    selected, deferred, started_multi = [], [], set()
-    for t in text_tasks:
-        if counts[t.question_id] == 1:
-            selected.append(t)  # standalone box: always safe to do now
-        elif t.question_id not in started_multi:
-            selected.append(t)  # first blank of a multi-part answer this press
-            started_multi.add(t.question_id)
+def reading_order(tasks: List[Task]) -> List[Task]:
+    """Sort controls the way a person reads the page: top-to-bottom by line,
+    left-to-right within a line. Two controls are on the same line when one's
+    vertical centre falls inside the other's box (so boxes of slightly
+    different heights on one line still group together)."""
+    by_y = sorted(tasks, key=lambda t: ((t.bbox.y1 + t.bbox.y2) / 2, t.bbox.x1))
+    rows = []
+    for task in by_y:
+        yc = (task.bbox.y1 + task.bbox.y2) / 2
+        if rows and rows[-1][0].bbox.y1 <= yc <= rows[-1][0].bbox.y2:
+            rows[-1].append(task)
         else:
-            deferred.append(t)  # a later blank of a multi-part answer: wait
+            rows.append([task])
+    return [t for row in rows for t in sorted(row, key=lambda t: t.bbox.x1)]
 
-    return selected, deferred
+
+def plan_actions(final_tasks: List[Task]):
+    """Decide WHAT to do this press and in WHICH order.
+    Returns (actions, deferred):
+      - A question with several text boxes and no option to select: every
+        box is filled now.
+      - A question whose option is being selected THIS press and that has
+        several blanks: the option plus its FIRST blank now, the other
+        blanks deferred to the next press (if ONE_TEXT_BOX_PER_PRESS).
+      - Within a question, option clicks always come before its blanks.
+      - With FILL_BOTTOM_TO_TOP, questions are done bottom-up and blanks
+        right-to-left, so a box that grows as it's typed into can't shift a
+        box that hasn't been filled yet."""
+    page_pos = {id(t): i for i, t in enumerate(reading_order(final_tasks))}
+
+    groups = {}
+    for task in final_tasks:
+        groups.setdefault(task.question_id, []).append(task)
+
+    planned, deferred = [], []
+    for qtasks in groups.values():
+        options = reading_order([t for t in qtasks if t.input_type == "click_option"])
+        texts = reading_order([t for t in qtasks if t.input_type == "type_text"])
+
+        if ONE_TEXT_BOX_PER_PRESS and options and len(texts) > 1:
+            deferred.extend(texts[1:])
+            texts = texts[:1]
+
+        if FILL_BOTTOM_TO_TOP:
+            texts = texts[::-1]
+
+        top = min(page_pos[id(t)] for t in qtasks)
+        planned.append((top, options + texts))
+
+    planned.sort(key=lambda item: item[0], reverse=FILL_BOTTOM_TO_TOP)
+    actions = [t for _, group in planned for t in group]
+    return actions, deferred
 
 
 def perform_tasks_with_gap(tasks, width: int, height: int):
@@ -1359,6 +2688,17 @@ def uses_single_result():
     or race mode); False whenever multiple sources need to agree first
     (Consult mode, or Gemini+OpenRouter multi-AI mode)."""
     return GEMINI_ONLY and not GEMINI_CONSULT
+
+
+def mark_clicks(shot: Image.Image, points):
+    """Draw a small red ring at every spot clicked this press."""
+    try:
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(shot)
+        for x, y in points:
+            draw.ellipse((x - 9, y - 9, x + 9, y + 9), outline=(230, 0, 0), width=2)
+    except Exception as e:
+        print(f"[SCREENSHOT] Could not mark clicks: {e}")
 
 
 def save_screenshot(screenshot: Image.Image):
@@ -1385,11 +2725,9 @@ def save_screenshot(screenshot: Image.Image):
 
 def capture_and_solve():
     """Screenshot -> AI -> final task list for THIS moment of the page.
-    Returns (final_tasks, results, width, height, timing_dict). Used both
-    for the initial solve and, if needed, for a fresh re-solve after
-    clicking a radio option (see run_solver: selecting an option can
-    reflow the page, shifting where its text boxes actually are - so their
-    positions from the FIRST screenshot can go stale)."""
+    Returns (final_tasks, results, width, height, timing_dict, screenshot).
+    Called once
+    per hotkey press - every press starts from a fresh screenshot."""
     t0 = time.perf_counter()
     screenshot = pyautogui.screenshot()
     width, height = screenshot.size
@@ -1404,6 +2742,11 @@ def capture_and_solve():
         f"upload size: {len(image_b64) / 1024:.0f} KB ({mime})"
     )
 
+    global _press_gray, _press_size
+    _point_cache.clear()
+    _press_size = (width, height)
+    _press_gray = _Gray(screenshot) if (SNAP_TO_CONTROLS and not uses_single_result()) else None
+
     t0 = time.perf_counter()
     results = gather_results(image_b64, mime)
     t_ai = time.perf_counter() - t0
@@ -1416,7 +2759,7 @@ def capture_and_solve():
         final_tasks = consensus_tasks(results) if len(results) >= CONSENSUS_MIN else []
 
     timing = {"capture": t_capture, "image": t_image, "ai": t_ai}
-    return final_tasks, results, width, height, timing
+    return final_tasks, results, width, height, timing, screenshot
 
 
 def run_solver():
@@ -1430,6 +2773,8 @@ def run_solver():
     try:
         if GEMINI_ONLY and GEMINI_CONSULT:
             mode_label = "GEMINI CONSULT"
+        elif GEMINI_ONLY and USE_GEMINI_FLASH_CYCLE:
+            mode_label = f"GEMINI FLASH CYCLE - {cycle_next_model() or 'all used up'}"
         elif GEMINI_ONLY and USE_GEMINI_FLASH_RACE:
             mode_label = "GEMINI FLASH RACE"
         elif GEMINI_ONLY:
@@ -1441,56 +2786,72 @@ def run_solver():
         print(f"CAPTURING SCREEN  (mode: {mode_label})")
         print("=" * 70)
 
-        final_tasks, results, width, height, timing = capture_and_solve()
+        _clicked_points.clear()
+        final_tasks, results, width, height, timing, screenshot = capture_and_solve()
 
         if uses_single_result():
             if not results:
                 print("\nERROR: Gemini returned no usable result.")
                 print("Nothing was clicked or typed.")
-                play_error_sound()
+                play_error()
                 return
         else:
             if len(results) < CONSENSUS_MIN:
                 print("\nERROR:")
                 print("Not enough independent AI results for safe consensus.")
                 print("Nothing was clicked or typed.")
-                play_error_sound()
+                play_error()
                 return
             if not final_tasks:
                 print("\nNo question reached AI agreement.")
                 print("Nothing was clicked or typed.")
-                play_error_sound()
+                play_error()
                 return
 
         print_final(final_tasks)
 
         t0 = time.perf_counter()
+        final_tasks, same_box = snap_tasks(final_tasks, screenshot)
+        t_snap = time.perf_counter() - t0
 
-        option_tasks = [t for t in final_tasks if t.input_type == "click_option"]
-        text_tasks = [t for t in final_tasks if t.input_type == "type_text"]
-
-        # Radio/checkbox options are clicked FIRST - nothing has been typed
-        # yet, so their positions are still accurate.
-        if option_tasks:
-            perform_tasks_with_gap(option_tasks, width, height)
-
-        # Text boxes: independent single-blank questions are all done
-        # together (filling one can't shift a completely different
-        # question); a multi-blank question only gets its FIRST blank this
-        # press (see select_text_tasks_to_perform for why). A single lone
-        # text box still finishes in this same press either way.
-        if text_tasks:
-            selected, deferred = select_text_tasks_to_perform(text_tasks)
-            if TEST_MODE:
-                perform_tasks_with_gap(text_tasks, width, height)  # preview every position
-            else:
-                perform_tasks_with_gap(selected, width, height)
-                if deferred:
-                    labels = ", ".join(t.part or t.question_id for t in deferred)
+        if NEVER_CLICK_ZONES:
+            kept = []
+            for t in final_tasks:
+                x, y = control_center(t, width, height)
+                if in_never_click_zone(x, y):
                     print(
-                        f"\n[NEXT] {len(deferred)} more box(es) remaining ({labels}). "
-                        f"Press {HOTKEY.upper()} again to continue."
+                        f"[BLOCKED] Q{t.question_id} {t.part or t.input_type} at ({x}, {y}) "
+                        f"is inside NEVER_CLICK_ZONES - not clicked."
                     )
+                else:
+                    kept.append(t)
+            final_tasks = kept
+
+        t0 = time.perf_counter()
+
+        if TEST_MODE:
+            # Preview EVERY position, including blanks that a real run would
+            # leave for the next press.
+            actions, deferred = plan_actions(final_tasks)
+            actions = actions + deferred
+            deferred = []
+        else:
+            actions, deferred = plan_actions(final_tasks)
+        deferred = deferred + same_box
+
+        if not actions and not deferred:
+            print("\nNothing left to click or type (everything was blocked or skipped).")
+            play_error()
+            return
+
+        perform_tasks_with_gap(actions, width, height)
+
+        if deferred:
+            labels = ", ".join(t.part or t.question_id for t in deferred)
+            print(
+                f"\n[NEXT] {len(deferred)} more box(es) remaining ({labels}). "
+                f"Press {HOTKEY.upper()} again to continue."
+            )
 
         t_act = time.perf_counter() - t0
 
@@ -1506,7 +2867,7 @@ def run_solver():
         print(f"Total time:          {elapsed:.2f} seconds")
         print(
             f"  capture {timing['capture'] * 1000:.0f}ms | image prep {timing['image'] * 1000:.0f}ms | "
-            f"AI {timing['ai']:.2f}s | actions {t_act * 1000:.0f}ms"
+            f"AI {timing['ai']:.2f}s | snap {t_snap * 1000:.0f}ms | actions {t_act * 1000:.0f}ms"
         )
         print("=" * 70)
 
@@ -1518,7 +2879,7 @@ def run_solver():
     except Exception as e:
         print(f"\n[FATAL ERROR] {type(e).__name__}: {e}")
         print(f"Time before error: {time.perf_counter() - start_time:.2f} seconds")
-        play_error_sound()
+        play_error()
 
     finally:
         try:
@@ -1526,7 +2887,10 @@ def run_solver():
             # result. Skipped on an emergency stop so nothing more happens.
             if SAVE_SCREENSHOTS and not emergency_stop:
                 time.sleep(SCREENSHOT_DELAY_SECONDS)
-                save_screenshot(pyautogui.screenshot())
+                shot = pyautogui.screenshot()
+                if MARK_CLICKS_ON_SCREENSHOTS:
+                    mark_clicks(shot, _clicked_points)
+                save_screenshot(shot)
         except Exception as e:
             print(f"[SCREENSHOT] Could not take the final screenshot: {e}")
         finally:
@@ -1554,6 +2918,8 @@ def warm_up():
     if gemini_client is not None:
         if GEMINI_CONSULT:
             warm_models = enabled_gemini_models()
+        elif USE_GEMINI_FLASH_CYCLE:
+            warm_models = [cycle_next_model()]
         elif USE_GEMINI_FLASH_RACE:
             warm_models = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
         else:
@@ -1576,12 +2942,38 @@ if __name__ == "__main__":
     print(f"Test mode:   {TEST_MODE}")
     print(f"Gemini only: {GEMINI_ONLY}")
     if GEMINI_CONSULT:
-        consult_models = enabled_gemini_models()
-        print(f"Gemini:      CONSULT MODE - {' + '.join(consult_models) or 'NO MODELS ENABLED'} (thinking: {GEMINI_THINKING})")
+        asks = consult_asks()
+        print(
+            f"Gemini:      CONSULT MODE - {' + '.join(l for l, _ in asks) or 'NO MODELS ENABLED'} "
+            f"(thinking: {GEMINI_THINKING}; majority of {len(asks)}, at least {CONSENSUS_MIN} must agree)"
+        )
+    elif USE_GEMINI_FLASH_CYCLE:
+        if RESET_FLASH_CYCLE_ON_START:
+            forget_cycle_state()
+            print("Gemini:      Flash Cycle memory cleared (RESET_FLASH_CYCLE_ON_START).")
+        _load_cycle_state()
+        print(f"Gemini:      FLASH CYCLE - {' -> '.join(cycle_order())} (thinking: {GEMINI_THINKING})")
+        now = time.time()
+        for m in cycle_order():
+            sent = _cycle_sent.get(m, 0)
+            if _cycle_blocked.get(m, 0) > now:
+                print(
+                    f"             {m}: skipped until {_reset_time_text(_cycle_blocked[m])} "
+                    f"({sent} request(s) sent today)"
+                )
+            elif sent:
+                print(f"             {m}: {sent} request(s) sent today")
+        print(f"             starting with: {cycle_next_model() or 'NONE - all used up for today'}")
     elif USE_GEMINI_FLASH_RACE:
         print(f"Gemini:      RACE MODE - gemini-3.1-flash-lite vs gemini-3.5-flash-lite (thinking: {GEMINI_THINKING})")
     else:
         print(f"Gemini:      {GEMINI_MODEL} (thinking: {GEMINI_THINKING})")
+    maths = []
+    if LOCAL_MATH:
+        maths.append("worked out on this PC (LOCAL_MATH)")
+    if GEMINI_CODE_EXECUTION:
+        maths.append("Python in Google's sandbox (slow)")
+    print(f"Maths:       {' + '.join(maths) or 'AI only'}")
     if not GEMINI_ONLY:
         print(f"OpenRouter:  {OPENROUTER_MODEL} x{OPENROUTER_CALLS}")
     print()
@@ -1589,21 +2981,37 @@ if __name__ == "__main__":
     print("Emergency stop: move the mouse to the TOP-LEFT corner.")
     print("=" * 70)
 
-    if not GEMINI_API_KEY:
-        print("WARNING: GEMINI_API_KEY is not set.")
-    if GEMINI_CONSULT and len(enabled_gemini_models()) < 2:
-        print("WARNING: GEMINI_CONSULT is on but fewer than 2 models are enabled - turn on at least 2.")
-    elif not GEMINI_CONSULT and not USE_GEMINI_FLASH_RACE and GEMINI_MODEL is None:
+    if key_is_placeholder("GEMINI_API_KEY"):
+        print("WARNING: GEMINI_API_KEY in .env is still the placeholder ENTER_KEY_HERE.")
+        print("         Replace it with your real key (Google AI Studio -> Get API key).")
+    elif not GEMINI_API_KEY:
+        print("WARNING: GEMINI_API_KEY is not set. Add GEMINI_API_KEY=your_key to .env")
+        print("         next to this script.")
+    if not GEMINI_ONLY and not OPENROUTER_API_KEY:
+        if key_is_placeholder("OPENROUTER_API_KEY"):
+            print("WARNING: OPENROUTER_API_KEY in .env is still a placeholder.")
+        else:
+            print("WARNING: GEMINI_ONLY is off but OPENROUTER_API_KEY is not set.")
+    if GEMINI_CONSULT and len(consult_asks()) < 2:
+        print("WARNING: GEMINI_CONSULT needs at least 2 answers per press - turn on another")
+        print("         model or set GEMINI_CONSULT_REPEAT to 2 or more.")
+    elif USE_GEMINI_FLASH_CYCLE and not cycle_order():
+        print("WARNING: USE_GEMINI_FLASH_CYCLE is on but FLASH_CYCLE_MODELS is empty.")
+    elif (not GEMINI_CONSULT and not USE_GEMINI_FLASH_CYCLE
+          and not USE_GEMINI_FLASH_RACE and GEMINI_MODEL is None):
         print("WARNING: no Gemini model enabled (all USE_GEMINI_... are False).")
 
-    if PLAY_SOUNDS:
-        _sound_wav("done")   # build both sounds now so the first one
-        _sound_wav("error")  # plays instantly
+    prepare_sounds()  # built before the first press
 
     if WARM_UP_CONNECTIONS:
         warm_up()
 
-    keyboard.add_hotkey(HOTKEY, run_solver)
+    # Each press runs in its own thread, so the keyboard hook is never
+    # blocked while the AI is thinking, and a second press during a solve
+    # is refused with [BUSY] instead of queueing up a second full solve.
+    keyboard.add_hotkey(
+        HOTKEY, lambda: threading.Thread(target=run_solver, daemon=True).start()
+    )
 
     try:
         keyboard.wait()
