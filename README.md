@@ -199,11 +199,7 @@ The settings are simple `True`/`False` switches near the top of `solver.py`. Ope
 | `SAVE_SCREENSHOTS` | `True` = saves a screenshot after every press (with red rings where it clicked) into a `tempscreenshots` folder. |
 | `PLAY_SOUNDS` | turns the chime / error tone on or off. |
 
-</details>
-
----
-
-## Troubleshooting
+### Troubleshooting
 
 | Problem | Fix |
 | --- | --- |
@@ -214,3 +210,5 @@ The settings are simple `True`/`False` switches near the top of `solver.py`. Ope
 | Mac: pressing the hotkey does nothing | Redo step 2.6. All three permissions must be on for Terminal, and Terminal must be fully restarted (`Cmd + Q`). |
 | Mac: the screenshot shows only your wallpaper | Screen Recording permission is missing (step 2.6). |
 | `429` / `RESOURCE_EXHAUSTED` / "limit used up" | That model's free daily limit is used up. It resets at midnight Pacific time. |
+
+</details>
