@@ -26,7 +26,24 @@ import wave
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Literal, Optional
 
-import keyboard
+# Shown when the program starts, so you can tell which copy you're running.
+SOLVER_VERSION = "2026-10-01 (Windows + Mac)"
+
+IS_MAC = sys.platform == "darwin"
+
+# Global hotkey: the "keyboard" library on Windows. On a Mac it needs to run
+# as administrator to listen for keys, so "pynput" is used there instead
+# (it only needs the normal Accessibility / Input Monitoring permission).
+if IS_MAC:
+    keyboard = None
+    try:
+        from pynput import keyboard as pynput_keyboard
+    except ImportError:
+        pynput_keyboard = None
+else:
+    import keyboard
+    pynput_keyboard = None
+
 import pyautogui
 import pyperclip
 from dotenv import load_dotenv
@@ -335,11 +352,6 @@ ERROR_VOLUME = 0.45
 # screenshot_2026-09-24_14-05-33-123.png, so they sort in the order taken.
 # (The on/off switch SAVE_SCREENSHOTS is at the very top of the file.)
 
-# Draw a small red ring on the saved screenshot at every spot that was
-# clicked, so you can tell a WRONG ANSWER apart from a WRONG POSITION when
-# something is missed.
-MARK_CLICKS_ON_SCREENSHOTS = True
-
 # Short wait before that final screenshot, so the page has finished showing
 # the typed answers / selected options.
 SCREENSHOT_DELAY_SECONDS = 0.3
@@ -351,7 +363,20 @@ pyautogui.PAUSE = 0
 pyautogui.FAILSAFE = True
 
 busy_lock = threading.Lock()
-_clicked_points = []  # screen spots clicked this press (for marked screenshots)
+
+# Select-all / paste use Cmd on a Mac, Ctrl everywhere else.
+SHORTCUT_KEY = "command" if IS_MAC else "ctrl"
+
+# Screenshot pixels -> mouse coordinates. The same on Windows (1, 1); on a
+# Mac Retina screen the screenshot has 2x the pixels of the mouse's
+# coordinate space, so every click would land at double the right spot
+# without this. Measured on every press (see capture_and_solve).
+_screen_scale = (1.0, 1.0)
+
+
+def to_screen(x, y):
+    sx, sy = _screen_scale
+    return int(round(x * sx)), int(round(y * sy))
 
 # ============================================================
 # DATA MODELS
@@ -2333,8 +2358,8 @@ def copy_to_clipboard(text: str) -> bool:
 
 
 def perform_task(task: Task, width: int, height: int):
-    x, y = control_center(task, width, height)
-    _clicked_points.append((x, y))
+    px, py = control_center(task, width, height)       # screenshot pixels
+    x, y = to_screen(px, py)                            # mouse coordinates
 
     print("\n" + "-" * 60)
     print(f"Question: {task.question}")
@@ -2373,9 +2398,9 @@ def perform_task(task: Task, width: int, height: int):
             # WHOLE PAGE instead of just the box's contents.
 
         time.sleep(CLICK_SETTLE_SECONDS)
-        pyautogui.hotkey("ctrl", "a")
+        pyautogui.hotkey(SHORTCUT_KEY, "a")
         time.sleep(CLIPBOARD_SETTLE_SECONDS)  # let select-all register first
-        pyautogui.hotkey("ctrl", "v")
+        pyautogui.hotkey(SHORTCUT_KEY, "v")
 
 
 def build_tone_wav(notes_hz, notes_ms, volume) -> bytes:
@@ -2690,17 +2715,6 @@ def uses_single_result():
     return GEMINI_ONLY and not GEMINI_CONSULT
 
 
-def mark_clicks(shot: Image.Image, points):
-    """Draw a small red ring at every spot clicked this press."""
-    try:
-        from PIL import ImageDraw
-        draw = ImageDraw.Draw(shot)
-        for x, y in points:
-            draw.ellipse((x - 9, y - 9, x + 9, y + 9), outline=(230, 0, 0), width=2)
-    except Exception as e:
-        print(f"[SCREENSHOT] Could not mark clicks: {e}")
-
-
 def save_screenshot(screenshot: Image.Image):
     """Save this exact screenshot to SCREENSHOT_FOLDER under a unique,
     timestamped name. Never raises: a failed save is reported but never
@@ -2733,12 +2747,21 @@ def capture_and_solve():
     width, height = screenshot.size
     t_capture = time.perf_counter() - t0
 
+    global _screen_scale
+    try:
+        sw, sh = pyautogui.size()
+        _screen_scale = (sw / width, sh / height) if width and height else (1.0, 1.0)
+    except Exception:
+        _screen_scale = (1.0, 1.0)
+
     t0 = time.perf_counter()
     image_b64, mime = prepare_image(screenshot)
     t_image = time.perf_counter() - t0
 
     print(
-        f"Screen resolution: {width} x {height} | "
+        f"Screen resolution: {width} x {height}"
+        + (f" (mouse: {to_screen(width, height)[0]} x {to_screen(width, height)[1]})" if _screen_scale != (1.0, 1.0) else "")
+        + " | "
         f"upload size: {len(image_b64) / 1024:.0f} KB ({mime})"
     )
 
@@ -2786,7 +2809,6 @@ def run_solver():
         print(f"CAPTURING SCREEN  (mode: {mode_label})")
         print("=" * 70)
 
-        _clicked_points.clear()
         final_tasks, results, width, height, timing, screenshot = capture_and_solve()
 
         if uses_single_result():
@@ -2850,7 +2872,7 @@ def run_solver():
             labels = ", ".join(t.part or t.question_id for t in deferred)
             print(
                 f"\n[NEXT] {len(deferred)} more box(es) remaining ({labels}). "
-                f"Press {HOTKEY.upper()} again to continue."
+                f"Press {hotkey_display(HOTKEY)} again to continue."
             )
 
         t_act = time.perf_counter() - t0
@@ -2887,14 +2909,114 @@ def run_solver():
             # result. Skipped on an emergency stop so nothing more happens.
             if SAVE_SCREENSHOTS and not emergency_stop:
                 time.sleep(SCREENSHOT_DELAY_SECONDS)
-                shot = pyautogui.screenshot()
-                if MARK_CLICKS_ON_SCREENSHOTS:
-                    mark_clicks(shot, _clicked_points)
-                save_screenshot(shot)
+                save_screenshot(pyautogui.screenshot())
         except Exception as e:
             print(f"[SCREENSHOT] Could not take the final screenshot: {e}")
         finally:
             busy_lock.release()
+
+
+# ============================================================
+# MAC HOTKEY (pynput)
+# ============================================================
+# macOS virtual key codes of the physical keys (US layout positions). Keys
+# are matched by these codes, not by the typed letter, because on a Mac
+# Option+S types "ß" - a letter match would never fire.
+_MAC_VK = {
+    "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8,
+    "v": 9, "b": 11, "q": 12, "w": 13, "e": 14, "r": 15, "y": 16, "t": 17,
+    "1": 18, "2": 19, "3": 20, "4": 21, "6": 22, "5": 23, "9": 25, "7": 26,
+    "8": 28, "0": 29, "o": 31, "u": 32, "i": 34, "p": 35, "l": 37, "j": 38,
+    "k": 40, "n": 45, "m": 46,
+}
+_MOD_NAMES = {
+    "ctrl": "ctrl", "control": "ctrl",
+    "alt": "alt", "option": "alt", "opt": "alt",
+    "shift": "shift",
+    "cmd": "cmd", "command": "cmd", "win": "cmd", "super": "cmd",
+}
+
+
+def parse_hotkey(hotkey: str):
+    """"ctrl+alt+s" -> ({"ctrl", "alt"}, "s")."""
+    mods, key = set(), None
+    for part in (p.strip().lower() for p in hotkey.split("+")):
+        if part in _MOD_NAMES:
+            mods.add(_MOD_NAMES[part])
+        elif part:
+            key = part
+    return mods, key
+
+
+def hotkey_display(hotkey: str) -> str:
+    """How to describe the hotkey to the user on this system."""
+    if not IS_MAC:
+        return hotkey.upper()
+    names = {"ctrl": "Control", "alt": "Option", "shift": "Shift", "cmd": "Command"}
+    mods, key = parse_hotkey(hotkey)
+    order = [m for m in ("ctrl", "alt", "shift", "cmd") if m in mods]
+    return " + ".join([names[m] for m in order] + [(key or "?").upper()])
+
+
+def make_mac_hotkey_handlers(hotkey: str, callback, kb):
+    """(on_press, on_release) for a pynput Listener that calls `callback`
+    once each time the hotkey is pressed."""
+    mods, key = parse_hotkey(hotkey)
+    target_vk = _MAC_VK.get(key)
+    target_special = getattr(kb.Key, key, None) if key and len(key) > 1 else None
+    mod_keys = {
+        "ctrl": {"ctrl", "ctrl_l", "ctrl_r"},
+        "alt": {"alt", "alt_l", "alt_r", "alt_gr"},
+        "shift": {"shift", "shift_l", "shift_r"},
+        "cmd": {"cmd", "cmd_l", "cmd_r"},
+    }
+    held = set()
+    fired = [False]
+
+    def mod_of(k):
+        name = getattr(k, "name", None)
+        for mod, names in mod_keys.items():
+            if name in names:
+                return mod
+        return None
+
+    def is_target(k):
+        if target_special is not None:
+            return k == target_special
+        vk = getattr(k, "vk", None)
+        ch = getattr(k, "char", None)
+        return (target_vk is not None and vk == target_vk) or (bool(ch) and ch.lower() == key)
+
+    def on_press(k):
+        mod = mod_of(k)
+        if mod:
+            held.add(mod)
+        elif is_target(k) and held == mods and not fired[0]:
+            fired[0] = True
+            callback()
+
+    def on_release(k):
+        mod = mod_of(k)
+        if mod:
+            held.discard(mod)
+        elif is_target(k):
+            fired[0] = False
+
+    return on_press, on_release
+
+
+def run_mac_hotkey(hotkey: str, callback):
+    """Listen for the hotkey on macOS until Ctrl+C."""
+    kb = pynput_keyboard
+    on_press, on_release = make_mac_hotkey_handlers(hotkey, callback, kb)
+    with kb.Listener(on_press=on_press, on_release=on_release) as listener:
+        time.sleep(0.5)
+        if getattr(listener, "IS_TRUSTED", True) is False:
+            print("\nWARNING: macOS isn't letting this program see key presses, so the")
+            print("hotkey won't work yet. Open System Settings -> Privacy & Security, and")
+            print("turn Terminal ON under BOTH 'Accessibility' and 'Input Monitoring'.")
+            print("Then quit Terminal completely (Cmd+Q), reopen it, and run this again.")
+        listener.join()
 
 
 # ============================================================
@@ -2938,7 +3060,8 @@ if __name__ == "__main__":
     print("=" * 70)
     print("SCREEN MATH SOLVER")
     print("=" * 70)
-    print(f"Hotkey:      {HOTKEY}")
+    print(f"Version:     {SOLVER_VERSION} on {'Mac' if IS_MAC else 'Windows' if sys.platform == 'win32' else sys.platform}")
+    print(f"Hotkey:      {hotkey_display(HOTKEY)}")
     print(f"Test mode:   {TEST_MODE}")
     print(f"Gemini only: {GEMINI_ONLY}")
     if GEMINI_CONSULT:
@@ -2977,7 +3100,7 @@ if __name__ == "__main__":
     if not GEMINI_ONLY:
         print(f"OpenRouter:  {OPENROUTER_MODEL} x{OPENROUTER_CALLS}")
     print()
-    print(f"Press {HOTKEY.upper()} to capture and analyze the current screen.")
+    print(f"Press {hotkey_display(HOTKEY)} to capture and analyze the current screen.")
     print("Emergency stop: move the mouse to the TOP-LEFT corner.")
     print("=" * 70)
 
@@ -3009,11 +3132,18 @@ if __name__ == "__main__":
     # Each press runs in its own thread, so the keyboard hook is never
     # blocked while the AI is thinking, and a second press during a solve
     # is refused with [BUSY] instead of queueing up a second full solve.
-    keyboard.add_hotkey(
-        HOTKEY, lambda: threading.Thread(target=run_solver, daemon=True).start()
-    )
+    def on_hotkey():
+        threading.Thread(target=run_solver, daemon=True).start()
 
     try:
-        keyboard.wait()
+        if IS_MAC:
+            if pynput_keyboard is None:
+                print("\nERROR: the 'pynput' package is missing. Run this, then start again:")
+                print("    python3 -m pip install pynput")
+                sys.exit(1)
+            run_mac_hotkey(HOTKEY, on_hotkey)
+        else:
+            keyboard.add_hotkey(HOTKEY, on_hotkey)
+            keyboard.wait()
     except KeyboardInterrupt:
         print("\nExiting.")
