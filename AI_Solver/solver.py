@@ -5,9 +5,30 @@
 # the "tempscreenshots" folder next to this script. Never auto-deleted.
 SAVE_SCREENSHOTS = False
 
+# With SAVE_SCREENSHOTS on: put every screenshot straight into ONE zip file,
+# "tempscreenshots.zip" next to this script, instead of loose images in the
+# "tempscreenshots" folder. New presses are added to the same zip.
+AUTO_ZIP_SCREENSHOTS = True
+
 # Rising chime when the answers are filled in; low falling tone when the AI
 # gives no usable solution. (No sound on the emergency stop.)
 PLAY_SOUNDS = True
+
+# After the answers are filled in, put the mouse back exactly where it was
+# just before the program started clicking. Instant, no click. Not done on
+# an emergency stop or in TEST_MODE (there you want to see where it went).
+RETURN_MOUSE_WHEN_DONE = False
+
+# Look things up in YOUR textbooks and references for NON-maths
+# multiple-choice questions (definitions, concepts, "which term does this
+# scenario describe?"). Put the files in the "Textbooks and References"
+# folder inside the AI_Solver folder (made automatically the first time you
+# run the program): PDFs (books, notes, slides saved as PDF), PowerPoint
+# (.pptx, speaker notes included), Word (.docx) and .txt / .md files.
+# They're read once when the program starts. Maths questions are answered
+# exactly as before, and this step can only change WHICH OPTION is clicked -
+# never a typed answer. PDFs need: pip install pymupdf
+USE_TEXTBOOKS_AND_REFERENCES = True
 
 import base64
 import io
@@ -22,24 +43,41 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import wave
+import xml.etree.ElementTree as ET
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Literal, Optional
 
 # Shown when the program starts, so you can tell which copy you're running.
-SOLVER_VERSION = "2026-10-01 (Windows + Mac)"
+SOLVER_VERSION = "2026-10-13 (Windows + Mac)"
 
 IS_MAC = sys.platform == "darwin"
 
 # Global hotkey: the "keyboard" library on Windows. On a Mac it needs to run
-# as administrator to listen for keys, so "pynput" is used there instead
-# (it only needs the normal Accessibility / Input Monitoring permission).
+# as administrator, so macOS's own keyboard event tap is used there instead
+# (see run_mac_hotkey_native), with "pynput" only as a backup.
 if IS_MAC:
     keyboard = None
     try:
         from pynput import keyboard as pynput_keyboard
     except ImportError:
         pynput_keyboard = None
+    # Known pynput problem on some Macs: pressing Caps Lock can crash the
+    # whole program. It comes from listening to "system-defined" (media key)
+    # events, which the hotkey doesn't need - so listen to plain key presses
+    # only. (Does nothing if pynput ever changes how this works.)
+    try:
+        import Quartz as _Quartz
+        if pynput_keyboard is not None and hasattr(pynput_keyboard.Listener, "_EVENTS"):
+            pynput_keyboard.Listener._EVENTS = (
+                _Quartz.CGEventMaskBit(_Quartz.kCGEventKeyDown)
+                | _Quartz.CGEventMaskBit(_Quartz.kCGEventKeyUp)
+                | _Quartz.CGEventMaskBit(_Quartz.kCGEventFlagsChanged)
+            )
+    except Exception:
+        pass
 else:
     import keyboard
     pynput_keyboard = None
@@ -49,7 +87,6 @@ import pyperclip
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from openai import BadRequestError, DefaultHttpxClient, OpenAI
 from PIL import Image
 from pydantic import BaseModel, Field
 
@@ -88,7 +125,6 @@ def key_is_placeholder(name: str) -> bool:
 
 
 GEMINI_API_KEY = read_key("GEMINI_API_KEY")
-OPENROUTER_API_KEY = read_key("OPENROUTER_API_KEY")
 
 # ---------------- Gemini model switches ----------------
 # Which model(s) are enabled. What this MEANS depends on the GEMINI MODE
@@ -121,22 +157,16 @@ LOCAL_MATH = True
 # runs). LOCAL_MATH above gets the arithmetic right without that wait.
 GEMINI_CODE_EXECUTION = False
 
-# ---------------- GEMINI MODE (pick ONE of these True) ----------------
-# GEMINI_ONLY: only Gemini is used at all - OpenRouter is skipped entirely.
-# Turn this OFF to fall back to Gemini + OpenRouter multi-AI consensus
-# instead (see OPENROUTER_MODEL / OPENROUTER_CALLS / CONSENSUS_MIN below).
-# The three modes below only apply while this is True:
-GEMINI_ONLY = True
-
-#   - Plain (both False): the single model enabled above is used, alone.
+# ---------------- GEMINI MODE (leave all False, or pick ONE) ----------------
+#   - Plain (all False): the single model enabled above is used, alone.
 #   - USE_GEMINI_FLASH_RACE: sends the SAME request to BOTH Flash-Lite
 #     models (3.1 and 3.5) at once and uses whichever answers first,
 #     ignoring the slower one - ignores the individual switches above.
 #     Trades one extra concurrent API call (counts against BOTH models'
 #     free-tier quotas) for lower, more consistent latency.
 #   - GEMINI_CONSULT: every model switched ON above is queried in parallel
-#     and their answers must AGREE (same consensus rule as multi-AI mode,
-#     see CONSENSUS_MIN) before anything is clicked or typed. E.g. turn on
+#     and their answers must AGREE (see CONSENSUS_MIN) before anything is
+#     clicked or typed. E.g. turn on
 #     both Flash-Lite models with this True and they must consult and agree
 #     on each answer. Needs at least 2 models enabled to do anything.
 #   - USE_GEMINI_FLASH_CYCLE: uses the (non-Lite) Flash models in
@@ -176,8 +206,6 @@ FLASH_CYCLE_FALLBACK = "gemini-3.5-flash-lite"
 # e.g. if you think a model was wrongly marked as used up.
 RESET_FLASH_CYCLE_ON_START = False
 
-OPENROUTER_MODEL = "openrouter/free"
-
 HOTKEY = "ctrl+alt+s"
 
 # SAFETY: controls the program will NEVER click, whatever the AI says. An
@@ -208,16 +236,11 @@ TEST_MODE = False
 # first hotkey press doesn't pay for DNS + TLS handshakes.
 WARM_UP_CONNECTIONS = True
 
-# How many parallel OpenRouter calls to make (ignored if GEMINI_ONLY).
-OPENROUTER_CALLS = 3
-
-# OpenRouter: attempt 1 asks for JSON mode, attempt 2 drops response_format.
-OPENROUTER_RETRIES = 2
-
-# Never act on fewer than this many agreeing AI results (ignored if GEMINI_ONLY).
+# Consult mode: never act on fewer than this many agreeing answers.
 CONSENSUS_MIN = 2
 
-# Stop waiting for slow AIs as soon as every question already has agreement.
+# Consult mode: stop waiting for slow answers as soon as every question
+# already has agreement.
 EARLY_EXIT = True
 
 # Network timeout per request, in seconds (prevents a hung request from
@@ -355,6 +378,9 @@ ERROR_VOLUME = 0.45
 # Short wait before that final screenshot, so the page has finished showing
 # the typed answers / selected options.
 SCREENSHOT_DELAY_SECONDS = 0.3
+SCREENSHOT_ZIP = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "tempscreenshots.zip"
+)
 SCREENSHOT_FOLDER = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "tempscreenshots"
 )
@@ -407,6 +433,9 @@ class Task(BaseModel):
     # many decimal places to round it to (None = exact).
     calc: Optional[str] = None
     round_to: Optional[int] = None
+    # USE_TEXTBOOKS_AND_REFERENCES: key terms of a non-maths multiple-choice question to
+    # look up in the textbooks (set on its click_option task).
+    lookup_terms: Optional[List[str]] = None
 
 
 class SolverResponse(BaseModel):
@@ -450,6 +479,17 @@ SOLVER_SCHEMA = {
     },
     "required": ["tasks"],
 }
+
+# Same, plus "lookup_terms" - only used when USE_TEXTBOOKS_AND_REFERENCES is on, so with the
+# switch off every request is exactly what it was before.
+TEXTBOOK_SCHEMA = json.loads(json.dumps(SOLVER_SCHEMA))
+_tb_items = TEXTBOOK_SCHEMA["properties"]["tasks"]["items"]
+_tb_items["properties"] = {
+    **{k: v for k, v in _tb_items["properties"].items() if k in ("question_id", "question")},
+    "lookup_terms": {"type": "array", "items": {"type": "string"}},
+    **{k: v for k, v in _tb_items["properties"].items() if k not in ("question_id", "question")},
+}
+_tb_items["required"] = _tb_items["required"] + ["lookup_terms"]
 
 # ============================================================
 # SHARED API CLIENTS (created once -> connection reuse, no repeated
@@ -499,37 +539,9 @@ def make_gemini_client():
     return genai.Client(api_key=GEMINI_API_KEY)
 
 
-def make_openrouter_client():
-    if not OPENROUTER_API_KEY or GEMINI_ONLY:
-        return None
-
-    kwargs = dict(
-        api_key=OPENROUTER_API_KEY,
-        base_url="https://openrouter.ai/api/v1",
-        timeout=REQUEST_TIMEOUT,
-        max_retries=0,  # we handle retries ourselves; SDK default is 2 hidden retries
-        default_headers={
-            "HTTP-Referer": "http://localhost",
-            "X-Title": "Screen Math Solver",
-        },
-    )
-
-    limits = _limits()
-    if limits is not None:
-        try:
-            return OpenAI(**kwargs, http_client=DefaultHttpxClient(limits=limits))
-        except Exception:
-            pass
-
-    return OpenAI(**kwargs)
-
-
 gemini_client = make_gemini_client()
-openrouter_client = make_openrouter_client()
 
-# Flips to False if OpenRouter rejects response_format, so later runs
-# don't waste a request re-discovering that.
-_openrouter_json_mode = True
+
 
 # ============================================================
 # AI PROMPT
@@ -751,6 +763,25 @@ YOU CAN RUN PYTHON CODE. Use it for ALL the maths:
   equation(s).
 - Base every answer on the code's output, never on mental arithmetic.
 - Finally, return ONLY the JSON object described above.
+"""
+
+# Added to the prompt when USE_TEXTBOOKS_AND_REFERENCES is on.
+TEXTBOOK_PROMPT = r"""
+
+TEXTBOOK AND REFERENCE LOOKUP (the student's own course textbooks and
+reference material are available):
+- lookup_terms: fill this ONLY on the click_option task of a NON-MATH
+  multiple-choice question (definitions, concepts, theories, "which term
+  does this scenario / example describe?", true/false about a concept).
+  List the key term from EACH answer option (e.g. "negative
+  reinforcement", "punishment", "extinction") plus any key term named in
+  the question: short phrases exactly as written on screen, at most 8.
+  The program looks them up in those sources and then asks you again with
+  their definitions.
+- Use [] for EVERY math question (numbers, formulas, equations, graphs,
+  calculations - including math multiple choice) and for every type_text
+  task.
+- Still give your best answer now, as usual.
 """
 
 # ============================================================
@@ -1041,6 +1072,19 @@ def apply_local_math(task):
     )
 
 
+def _clean_terms(value) -> Optional[List[str]]:
+    """lookup_terms from the AI: short, unique, non-empty strings (max 8)."""
+    if not isinstance(value, list):
+        return None
+    terms, seen = [], set()
+    for v in value:
+        t = _WS.sub(" ", str(v)).strip(" .,:;\"'()[]") if v is not None else ""
+        if 1 < len(t) <= 80 and t.lower() not in seen:
+            seen.add(t.lower())
+            terms.append(t)
+    return terms[:8] or None
+
+
 def task_from_dict(raw) -> Optional[Task]:
     if not isinstance(raw, dict):
         return None
@@ -1137,6 +1181,7 @@ def task_from_dict(raw) -> Optional[Task]:
         part=part,
         calc=calc if input_type == "type_text" else None,
         round_to=round_to if input_type == "type_text" else None,
+        lookup_terms=_clean_terms(raw.get("lookup_terms")) if input_type == "click_option" else None,
     )
 
 
@@ -1250,26 +1295,6 @@ def parse_solver_text(text: str) -> SolverResponse:
     return result
 
 
-def _text_of(item) -> Optional[str]:
-    if isinstance(item, str):
-        return item
-    if isinstance(item, dict):
-        for key in ("text", "content"):
-            if isinstance(item.get(key), str):
-                return item[key]
-    return None
-
-
-def extract_openrouter_content(response) -> str:
-    try:
-        content = response.choices[0].message.content
-    except Exception:
-        return ""
-
-    if isinstance(content, list):
-        return "\n".join(t for t in map(_text_of, content) if t)
-
-    return _text_of(content) or ""
 
 
 # ============================================================
@@ -1363,7 +1388,9 @@ def _looks_like_tool_rejection(e: Exception) -> bool:
     )
 
 
-def _create_interaction(model: str, image_b64: str, mime: str):
+def _create_interaction(model: str, image_b64: str, mime: str, second_look: str = ""):
+    """second_look: extra instructions + textbook excerpts for the textbook
+    pass (USE_TEXTBOOKS_AND_REFERENCES). Empty for a normal request."""
     image_part = {"type": "image", "data": image_b64, "mime_type": mime}
     use_detail = bool(GEMINI_IMAGE_DETAIL) and model not in _no_image_detail
     use_code = GEMINI_CODE_EXECUTION and model not in _no_code_execution
@@ -1372,7 +1399,12 @@ def _create_interaction(model: str, image_b64: str, mime: str):
         part = dict(image_part)
         if use_detail:
             part["resolution"] = GEMINI_IMAGE_DETAIL
-        prompt = SOLVER_PROMPT + (CODE_EXECUTION_PROMPT if use_code else "")
+        prompt = SOLVER_PROMPT
+        if USE_TEXTBOOKS_AND_REFERENCES and not second_look:
+            prompt += TEXTBOOK_PROMPT
+        if use_code:
+            prompt += CODE_EXECUTION_PROMPT
+        prompt += second_look
         kwargs = dict(
             model=model,
             input=[{"type": "text", "text": prompt}, part],
@@ -1380,7 +1412,7 @@ def _create_interaction(model: str, image_b64: str, mime: str):
             response_format={
                 "type": "text",
                 "mime_type": "application/json",
-                "schema": SOLVER_SCHEMA,
+                "schema": TEXTBOOK_SCHEMA if USE_TEXTBOOKS_AND_REFERENCES else SOLVER_SCHEMA,
             },
         )
         if use_code:
@@ -1438,6 +1470,608 @@ def _code_runs(interaction) -> int:
     )
 
 
+# ============================================================
+# TEXTBOOKS AND REFERENCES (see USE_TEXTBOOKS_AND_REFERENCES)
+# ============================================================
+# The books are read once at startup, in the background (so the hotkey works
+# straight away), and their text is cached in "references_index.json" next to
+# this script so the next start is near-instant. Search is a small keyword
+# index on this PC - milliseconds per lookup, nothing sent anywhere except
+# the few excerpts that answer the current question.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TEXTBOOK_FOLDER = os.path.join(_SCRIPT_DIR, "Textbooks and References")
+TEXTBOOK_CACHE = os.path.join(_SCRIPT_DIR, "references_index.json")
+TEXTBOOK_SNIPPETS_PER_TERM = 2     # textbook passages sent per looked-up term
+TEXTBOOK_SNIPPET_CHARS = 1200      # length of each passage
+TEXTBOOK_MAX_CHARS = 16000         # total excerpt budget per question set
+_TEXTBOOK_EXTS = (".pdf", ".docx", ".pptx", ".txt", ".md")
+# Old Office formats that can't be read directly -> what to re-save them as.
+_LEGACY_EXTS = {".doc": ".docx", ".ppt": ".pptx", ".pps": ".pptx", ".ppsx": ".pptx"}
+_CACHE_VERSION = 2
+_TB_STOP = set(
+    "a an the of and or to in on for with by as at from is are was were be been "
+    "this that these those it its which who whom what when where why how not no "
+    "than then there their they them he she his her we our you your i".split()
+)
+
+_textbooks = None                     # TextbookIndex once loaded
+_textbooks_ready = threading.Event()  # set when loading finished (even if empty)
+
+
+def _tb_stem(w: str) -> str:
+    if len(w) > 4 and w.endswith("ies"):
+        return w[:-3] + "y"
+    if len(w) > 3 and w.endswith("s") and not w.endswith(("ss", "us", "is")):
+        return w[:-1]
+    return w
+
+
+def _tb_tokens(text: str):
+    return [_tb_stem(w) for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in _TB_STOP]
+
+
+def _tb_clean_page(text: str) -> str:
+    # NFKC turns PDF ligatures and odd characters into plain letters
+    # ("\ufb01" -> "fi", so "definition" can actually be found).
+    text = unicodedata.normalize("NFKC", text or "")
+    text = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", text)  # re-join hyphenated line breaks
+    return _WS.sub(" ", text).strip()
+
+
+class TextbookIndex:
+    """Pages of every file, with a BM25 keyword index and a word -> pages
+    lookup table, so a search only ever looks at pages that contain the
+    term's words (fast however many books there are)."""
+
+    def __init__(self, pages):
+        # pages: list of (file_name, "page 12" / "slide 3" / "part 2", text)
+        self.pages = [(b, n, t) for b, n, t in pages if t]
+        self.lower = [t.lower() for _, _, t in self.pages]
+        self.tf = []
+        self.df = {}
+        self.post = {}  # word -> list of page indexes that contain it
+        for i, text in enumerate(self.lower):
+            counts = {}
+            for tok in _tb_tokens(text):
+                counts[tok] = counts.get(tok, 0) + 1
+            self.tf.append(counts)
+            for tok in counts:
+                self.df[tok] = self.df.get(tok, 0) + 1
+                self.post.setdefault(tok, []).append(i)
+        self.lengths = [sum(c.values()) for c in self.tf]
+        self.avg = (sum(self.lengths) / len(self.lengths)) if self.lengths else 1.0
+
+    def _bm25(self, i, qtoks):
+        n, score = len(self.pages), 0.0
+        tf, dl = self.tf[i], self.lengths[i] or 1
+        for q in qtoks:
+            f = tf.get(q, 0)
+            if f:
+                idf = math.log(1 + (n - self.df[q] + 0.5) / (self.df[q] + 0.5))
+                score += idf * f * 2.2 / (f + 1.2 * (0.25 + 0.75 * dl / self.avg))
+        return score
+
+    def search_term(self, term: str, k: int = TEXTBOOK_SNIPPETS_PER_TERM):
+        """Best passages for one term: [(book, page, snippet)]. Pages that
+        contain the exact phrase come first, preferring ones that DEFINE it
+        ("X is / refers to / means ..."); pages with all its words otherwise.
+        Nothing is returned for a term the books never mention."""
+        qtoks = list(dict.fromkeys(_tb_tokens(term)))
+        phrase = _WS.sub(" ", term.lower()).strip()
+        if not qtoks or not phrase:
+            return []
+        defn = re.compile(
+            re.escape(phrase) + r"s?\W{0,3}(?:\([^)]{0,40}\)\W{0,3})?"
+            r"(?:is|are|was|refers? to|is defined as|means|describes?|occurs? when|involves?)\b"
+        )
+        # Only pages that contain every word of the term can match at all.
+        postings = sorted((self.post.get(q, ()) for q in qtoks), key=len)
+        if not postings[0]:
+            return []
+        candidates = set(postings[0]).intersection(*postings[1:])
+        scored = []
+        for i in candidates:
+            text = self.lower[i]
+            pos = text.find(phrase)
+            if pos >= 0:
+                m = defn.search(text)
+                bonus = 20.0 + (15.0 if m else 0.0) + min(text.count(phrase), 5)
+                where = m.start() if m else pos
+            else:
+                bonus, where = 0.0, None
+            scored.append((bonus + self._bm25(i, qtoks), i, where))
+        scored.sort(reverse=True)
+        hits = []
+        for _, i, where in scored[:k]:
+            book, page, text = self.pages[i]
+            if where is None:
+                first = min((self.lower[i].find(q) for q in qtoks if q in self.lower[i]), default=0)
+                where = max(first, 0)
+            start = max(0, where - TEXTBOOK_SNIPPET_CHARS // 4)
+            snippet = text[start:start + TEXTBOOK_SNIPPET_CHARS]
+            if start > 0:
+                snippet = "..." + snippet
+            if start + TEXTBOOK_SNIPPET_CHARS < len(text):
+                snippet += "..."
+            hits.append((book, page, snippet))
+        return hits
+
+
+_IS_WINDOWS = os.name == "nt"
+
+
+def _long_path(path: str) -> str:
+    """Windows can't open a path longer than 260 characters the normal way -
+    it reports "The system cannot find the path specified" even though the
+    file is there. Downloaded textbooks often have huge names, so on Windows
+    every reference file is opened with Windows' long-path prefix, which
+    lifts that limit. Other systems don't have the limit: path returned unchanged."""
+    if not _IS_WINDOWS:
+        return path
+    import ntpath
+    path = ntpath.abspath(path)
+    if path.startswith("\\\\?\\"):
+        return path
+    if path.startswith("\\\\"):  # network share: \\server\share\...
+        return "\\\\?\\UNC\\" + path[2:]
+    return "\\\\?\\" + path
+
+
+class _NoPdfReader(Exception):
+    """Neither PyMuPDF nor pypdf is installed."""
+
+
+def _chunk_text(text: str, size: int = 3000):
+    """Cut text with no real pages into ~size-character parts, at paragraph
+    breaks where possible."""
+    parts, cur = [], ""
+    for para in re.split(r"\n\s*\n|\n(?=\S)", text):
+        while len(para) > size:  # one enormous paragraph
+            parts.append(cur + para[:size])
+            cur, para = "", para[size:]
+        if cur and len(cur) + len(para) > size:
+            parts.append(cur)
+            cur = ""
+        cur += para + "\n"
+    if cur.strip():
+        parts.append(cur)
+    return parts
+
+
+def _read_pdf(path: str):
+    """PDF pages. PyMuPDF if installed (many times faster, better text),
+    otherwise pypdf."""
+    import importlib
+    # Read the file here (works with any path length) and give the library
+    # the bytes, instead of letting each library open the path itself.
+    with open(path, "rb") as f:
+        data = f.read()
+    first_error = None
+    for modname in ("pymupdf", "fitz"):
+        try:
+            mod = importlib.import_module(modname)
+        except ImportError:
+            continue
+        if not hasattr(mod, "open"):
+            continue  # an unrelated package that happens to be called "fitz"
+        try:
+            with mod.open(stream=data, filetype="pdf") as doc:
+                if getattr(doc, "needs_pass", False) and not doc.authenticate(""):
+                    raise ValueError("it's password-protected")
+                return [page.get_text() for page in doc]
+        except ValueError:
+            raise
+        except Exception as e:
+            first_error = e  # try pypdf instead
+            break
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        if first_error is not None:
+            raise first_error
+        raise _NoPdfReader()
+    reader = PdfReader(io.BytesIO(data))
+    if reader.is_encrypted:
+        try:
+            reader.decrypt("")
+        except Exception:
+            raise ValueError("it's password-protected")
+    pages = []
+    for page in reader.pages:
+        try:
+            pages.append(page.extract_text() or "")
+        except Exception:
+            pages.append("")
+    return pages
+
+
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+_P = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+_R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_PKG = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+_MC_FALLBACK = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Fallback"
+
+
+def _xml_walk(el):
+    """Every element in document order, skipping the duplicate "fallback"
+    copy Word keeps of text boxes and shapes."""
+    yield el
+    for child in el:
+        if child.tag != _MC_FALLBACK:
+            yield from _xml_walk(child)
+
+
+def _read_docx(path: str):
+    """Word document. Uses the page breaks Word saved in the file when it has
+    them ("page N"), otherwise ~3000-character parts ("part N")."""
+    with zipfile.ZipFile(path) as z:
+        root = ET.fromstring(z.read("word/document.xml"))
+    pages, cur, has_pages = [], [], False
+
+    def new_page():
+        nonlocal cur, has_pages
+        if pages and not "".join(cur).strip():
+            return  # two break marks in a row = one page break
+        pages.append("".join(cur))
+        cur, has_pages = [], True
+
+    for el in _xml_walk(root):
+        tag = el.tag
+        if tag == _W + "p":
+            cur.append("\n")
+        elif tag == _W + "t" and el.text:
+            cur.append(el.text)
+        elif tag == _W + "tab":
+            cur.append(" ")
+        elif tag == _W + "br":
+            if el.get(_W + "type") == "page":
+                new_page()
+            else:
+                cur.append("\n")
+        elif tag == _W + "lastRenderedPageBreak":
+            new_page()
+    pages.append("".join(cur))
+    if has_pages:
+        return "page", pages
+    return "part", _chunk_text(pages[0])
+
+
+def _zip_rels(z, part: str):
+    """{relationship id: (target part, type)} for one part of an Office file."""
+    folder, name = part.rsplit("/", 1)
+    rels_part = f"{folder}/_rels/{name}.rels"
+    try:
+        root = ET.fromstring(z.read(rels_part))
+    except KeyError:
+        return {}
+    out = {}
+    for rel in root.iter(_PKG + "Relationship"):
+        target = rel.get("Target", "")
+        full = target.lstrip("/") if target.startswith("/") else _norm_part(f"{folder}/{target}")
+        out[rel.get("Id")] = (full, rel.get("Type", ""))
+    return out
+
+
+def _norm_part(path: str) -> str:
+    out = []
+    for piece in path.split("/"):
+        if piece == "..":
+            if out:
+                out.pop()
+        elif piece not in ("", "."):
+            out.append(piece)
+    return "/".join(out)
+
+
+def _shape_text(xml: bytes) -> str:
+    lines = []
+    for para in ET.fromstring(xml).iter(_A + "p"):
+        line = "".join(t.text or "" for t in para.iter(_A + "t"))
+        if line.strip():
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _read_pptx(path: str):
+    """PowerPoint: one entry per slide, in slide order, with the slide's
+    speaker notes added after its text."""
+    with zipfile.ZipFile(path) as z:
+        names = set(z.namelist())
+        order = []
+        try:
+            rels = _zip_rels(z, "ppt/presentation.xml")
+            for sld in ET.fromstring(z.read("ppt/presentation.xml")).iter(_P + "sldId"):
+                target = rels.get(sld.get(_R + "id"), ("", ""))[0]
+                if target in names:
+                    order.append(target)
+        except Exception:
+            order = []
+        if not order:  # fall back to the file names: slide1.xml, slide2.xml, ...
+            order = sorted(
+                (n for n in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
+                key=lambda n: int(re.findall(r"\d+", n)[-1]),
+            )
+        slides = []
+        for part in order:
+            text = _shape_text(z.read(part))
+            for target, rel_type in _zip_rels(z, part).values():
+                if rel_type.endswith("/notesSlide") and target in names:
+                    notes = _shape_text(z.read(target))
+                    if notes.strip():
+                        text += "\nSpeaker notes: " + notes
+            slides.append(text)
+    return "slide", slides
+
+
+def _read_book(path: str):
+    """(unit, [text of each page/slide/part]) for one file."""
+    name = path.lower()
+    if name.endswith(".pdf"):
+        return "page", _read_pdf(path)
+    if name.endswith(".docx"):
+        return _read_docx(path)
+    if name.endswith(".pptx"):
+        return _read_pptx(path)
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        return "part", _chunk_text(f.read())
+
+
+def _book_label(fname: str) -> str:
+    """Short name for a file, used to label its passages for the AI:
+    "Big Title -- Author -- edition -- isbn ... .pdf" -> "Big Title"."""
+    label = os.path.splitext(fname)[0].split(" -- ")[0].strip(" -_")
+    return (label[:57].rstrip() + "...") if len(label) > 60 else (label or fname)
+
+
+def ensure_reference_folder() -> bool:
+    """Make the "Textbooks and References" folder if it doesn't exist yet.
+    Returns True when it was just made."""
+    if os.path.isdir(TEXTBOOK_FOLDER):
+        return False
+    try:
+        os.makedirs(TEXTBOOK_FOLDER, exist_ok=True)
+        print(f"\n[REFERENCES] Made the folder '{os.path.basename(TEXTBOOK_FOLDER)}' in "
+              f"{os.path.dirname(TEXTBOOK_FOLDER)}.\n             Put your textbooks and "
+              f"references in it (PDF, Word .docx, PowerPoint .pptx, .txt), then turn "
+              f"on USE_TEXTBOOKS_AND_REFERENCES and restart.")
+        return True
+    except Exception as e:
+        print(f"\n[REFERENCES] Couldn't make the 'Textbooks and References' folder: {e}")
+        return False
+
+
+_progress_width = 0  # length of the progress line currently on screen
+
+
+def _show_progress(text: str):
+    """Write `text` over the progress line (same line, no new line)."""
+    global _progress_width
+    pad = max(0, _progress_width - len(text))
+    print("\r" + text + " " * pad, end="", flush=True)
+    _progress_width = len(text)
+
+
+def _end_progress(final: str = ""):
+    """Replace the progress line with `final` (or wipe it) and move on."""
+    global _progress_width
+    if _progress_width:
+        print("\r" + " " * _progress_width + "\r", end="", flush=True)
+        _progress_width = 0
+    if final:
+        print(final, flush=True)
+
+
+def load_textbooks():
+    """Read every file in TEXTBOOK_FOLDER (re-using the cache for files that
+    haven't changed) and build the index. Runs in a background thread.
+    Shows ONE progress line that counts up in place (1/3, 2/3, 3/3), then
+    replaces it with any problems found and, last, a "ready" line."""
+    global _textbooks
+    start_hint = f"you can start - press {hotkey_display(HOTKEY)}."
+    problems = []
+    try:
+        if ensure_reference_folder():
+            return  # just made it, so it's empty
+        names = [f for f in os.listdir(TEXTBOOK_FOLDER) if not f.startswith((".", "~$"))]
+        files = sorted(f for f in names if f.lower().endswith(_TEXTBOOK_EXTS))
+        for f in sorted(names):
+            ext = os.path.splitext(f)[1].lower()
+            if ext in _LEGACY_EXTS:
+                problems.append(f"{f}: old {ext} format - open it and use Save As -> "
+                                f"{_LEGACY_EXTS[ext]}, then restart.")
+        if not files:
+            for line in problems:
+                print(f"[REFERENCES] {line}")
+            print(f"[REFERENCES] The 'Textbooks and References' folder has nothing to read yet "
+                  f"(PDF, .docx, .pptx, .txt) - answering without references; {start_hint}")
+            return
+
+        try:
+            with open(TEXTBOOK_CACHE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cache = data.get("files", {}) if data.get("version") == _CACHE_VERSION else {}
+        except Exception:
+            cache = {}
+
+        new_cache, pages, changed, missing_pdf_reader = {}, [], False, False
+        total = len(files)
+        for i, fname in enumerate(files, 1):
+            _show_progress(f"[REFERENCES] Loading textbooks and references: {i}/{total}")
+            path = _long_path(os.path.join(TEXTBOOK_FOLDER, fname))
+            try:
+                st = os.stat(path)
+            except OSError as e:
+                # One bad file must never stop the others from loading.
+                problems.append(f"{fname}: couldn't open it ({e.strerror or e}) - skipped.")
+                continue
+            stamp = [st.st_size, int(st.st_mtime)]
+            entry = cache.get(fname)
+            if isinstance(entry, dict) and entry.get("stamp") == stamp and "error" in entry:
+                # Failed last time and hasn't changed since: don't try again.
+                problems.append(f"{fname}: couldn't read it ({entry['error']}) - skipped.")
+                new_cache[fname] = entry
+                continue
+            if not (isinstance(entry, dict) and entry.get("stamp") == stamp):
+                try:
+                    unit, raw = _read_book(path)
+                except _NoPdfReader:
+                    missing_pdf_reader = True
+                    continue
+                except Exception as e:
+                    reason = "not a valid file" if isinstance(e, (zipfile.BadZipFile, KeyError, ET.ParseError)) else str(e)
+                    problems.append(f"{fname}: couldn't read it ({reason}) - skipped.")
+                    new_cache[fname] = {"stamp": stamp, "error": reason}
+                    changed = True
+                    continue
+                entry = {"stamp": stamp, "unit": unit, "pages": [_tb_clean_page(t) for t in raw]}
+                changed = True
+            book_pages, unit = entry["pages"], entry.get("unit", "page")
+            if fname.lower().endswith(".pdf") and book_pages and \
+                    sum(len(t) for t in book_pages) < 25 * len(book_pages):
+                problems.append(f"{fname}: almost no text - probably scanned images, "
+                                f"which can't be searched.")
+            new_cache[fname] = entry
+            label = _book_label(fname)
+            pages.extend((label, f"{unit} {n}", t) for n, t in enumerate(book_pages, 1))
+
+        if missing_pdf_reader:
+            cmd = "python3 -m pip install pymupdf" if IS_MAC else "py -m pip install pymupdf"
+            problems.append(f"PDF files need PyMuPDF - install it once with:  {cmd}  "
+                            f"then restart.")
+        if changed or set(new_cache) != set(cache):
+            try:
+                with open(TEXTBOOK_CACHE, "w", encoding="utf-8") as f:
+                    json.dump({"version": _CACHE_VERSION, "files": new_cache}, f)
+            except Exception as e:
+                problems.append(f"couldn't save the cache ({e}) - files will be re-read next time.")
+
+        index = TextbookIndex(pages)
+        readable = sum(1 for e in new_cache.values() if "error" not in e)
+        _end_progress()
+        for line in problems:
+            print(f"[REFERENCES] {line}")
+        if index.pages:
+            _textbooks = index
+            print(f"[REFERENCES] {readable}/{total} files loaded - ready, {start_hint}", flush=True)
+        else:
+            print(f"[REFERENCES] None of the files could be read - answering without "
+                  f"references; {start_hint}", flush=True)
+    except Exception as e:
+        _end_progress()
+        for line in problems:
+            print(f"[REFERENCES] {line}")
+        print(f"[REFERENCES] Couldn't load the textbooks and references ({e}) - answering "
+              f"without them; {start_hint}")
+    finally:
+        _textbooks_ready.set()
+
+
+def start_textbook_loading():
+    threading.Thread(target=load_textbooks, daemon=True).start()
+
+
+def gather_excerpts(terms):
+    """Passages for the terms, within TEXTBOOK_MAX_CHARS, duplicates removed."""
+    out, seen, total = [], set(), 0
+    for term in terms:
+        for book, page, snippet in _textbooks.search_term(term):
+            key = (book, page, snippet[:80])
+            if key in seen:
+                continue
+            seen.add(key)
+            if total + len(snippet) > TEXTBOOK_MAX_CHARS:
+                return out
+            out.append((term, book, page, snippet))
+            total += len(snippet)
+    return out
+
+
+def textbook_second_look(model: str, image_b64: str, mime: str, result):
+    """If the AI marked non-maths multiple-choice questions for lookup, find
+    their terms in the textbooks and ask the SAME model once more with those
+    passages. Only those questions' option clicks can change; every other
+    task (all maths, all typed answers) is kept exactly as first answered.
+    Any problem -> the first answer is used."""
+    lookup = {}
+    for t in result.tasks:
+        if t.input_type == "click_option" and t.lookup_terms:
+            lookup.setdefault(t.question_id, t)
+    if not lookup:
+        return result
+    if not _textbooks_ready.is_set():
+        print("[REFERENCES] Still reading your textbooks and references - this press answers without them.")
+        return result
+    if _textbooks is None:
+        return result
+
+    terms = list(dict.fromkeys(term for t in lookup.values() for term in t.lookup_terms))
+    t0 = time.perf_counter()
+    excerpts = gather_excerpts(terms)
+    if not excerpts:
+        print(f"[REFERENCES] None of {terms} appear in your textbooks and references - keeping the AI's answer.")
+        return result
+    found = sorted({e[0] for e in excerpts}, key=terms.index)
+    print(f"[REFERENCES] Found {len(excerpts)} passage(s) for {found} "
+          f"in {(time.perf_counter() - t0) * 1000:.0f}ms - asking again with them...")
+
+    questions = "\n".join(f'- question_id "{qid}": {t.question}' for qid, t in lookup.items())
+    passages = "\n\n".join(f'[{book}, {where}] (about "{term}")\n{snippet}'
+                           for term, book, where, snippet in excerpts)
+    extra = (
+        "\n\nSECOND LOOK USING THE STUDENT'S TEXTBOOKS AND REFERENCES.\n"
+        "Re-answer ONLY these multiple-choice question(s), using exactly these "
+        "question_id values. Return click_option tasks for them only - no other "
+        "questions, no text boxes - and set lookup_terms to [] on every task:\n"
+        f"{questions}\n"
+        "Below are passages from the student's own textbooks and reference "
+        "material for the terms in the options. Compare the question or scenario "
+        "with each option's definition in these sources and choose the option whose "
+        "definition fits it best. Where these sources define a term differently "
+        "from everyday usage, follow the sources. For a term the passages don't "
+        "cover, use your own knowledge.\n\n"
+        f"PASSAGES FROM THE STUDENT'S TEXTBOOKS AND REFERENCES:\n{passages}\n"
+    )
+
+    t1 = time.perf_counter()
+    try:
+        count_request(model)
+        interaction = _create_interaction(model, image_b64, mime, second_look=extra)
+        second = parse_solver_text(_final_json_text(interaction))
+    except Exception as e:
+        print(f"[REFERENCES] Second look failed ({e}) - keeping the first answer.")
+        return result
+
+    new_opts = {}
+    for t in second.tasks:
+        if t.input_type == "click_option":
+            new_opts.setdefault(t.question_id, []).append(t)
+    if not any(qid in new_opts for qid in lookup) and len(lookup) == 1 and new_opts:
+        # The AI renamed the question (e.g. "Q3" for "3"): only one was asked.
+        only = next(iter(lookup))
+        new_opts = {only: [t for ts in new_opts.values() for t in ts]}
+
+    tasks = []
+    for t in result.tasks:
+        if t.input_type == "click_option" and t.question_id in lookup and t.question_id in new_opts:
+            continue  # replaced below
+        tasks.append(t)
+    for qid in lookup:
+        if qid not in new_opts:
+            print(f"[REFERENCES] Q{qid}: no answer in the second look - keeping the first one.")
+            continue
+        before = sorted((t.option or t.answer) for t in result.tasks
+                        if t.input_type == "click_option" and t.question_id == qid)
+        after = sorted((t.option or t.answer) for t in new_opts[qid])
+        if [a.lower() for a in before] == [a.lower() for a in after]:
+            print(f"[REFERENCES] Q{qid}: your textbooks/references agree with {after}.")
+        else:
+            print(f"[REFERENCES] Q{qid}: changed {before} -> {after} using your textbooks/references.")
+        tasks.extend(t.model_copy(update={"lookup_terms": None}) for t in new_opts[qid])
+    print(f"[REFERENCES] Second look took {time.perf_counter() - t1:.2f}s.")
+    return SolverResponse(tasks=tasks)
+
+
 def request_gemini(model: str, image_b64: str, mime: str):
     """One request to a SPECIFIC Gemini model. Returns a SolverResponse and
     RAISES on any failure (network, quota, unusable answer)."""
@@ -1452,6 +2086,8 @@ def request_gemini(model: str, image_b64: str, mime: str):
         f"[Gemini:{model}] Found {len(result.tasks)} question(s) "
         f"in {time.perf_counter() - start:.2f}s{ran}."
     )
+    if USE_TEXTBOOKS_AND_REFERENCES:
+        result = textbook_second_look(model, image_b64, mime, result)
     return result
 
 
@@ -1463,14 +2099,46 @@ def call_gemini_model(model: str, image_b64: str, mime: str):
         return None
 
     start = time.perf_counter()
-    try:
-        return request_gemini(model, image_b64, mime)
-    except Exception as e:
-        print(f"[Gemini:{model}] ERROR: {e}")
-        print(f"[Gemini:{model}] Failed after {time.perf_counter() - start:.2f}s.")
-        if _is_rate_limit_error(e):
-            print(f"  -> Rate limit / quota reached for {model}.")
-        return None
+    for attempt in (1, 2):
+        try:
+            return request_gemini(model, image_b64, mime)
+        except Exception as e:
+            # Google briefly overloaded / connection dropped: one quick
+            # automatic retry, so the press doesn't fail for nothing. Rate
+            # limits, timeouts and unusable answers are NOT retried.
+            if attempt == 1 and _is_brief_server_error(e):
+                print(f"[Gemini:{model}] Google had a hiccup ({_short_error(e)}) - "
+                      f"trying again in a second...")
+                time.sleep(1.0)
+                continue
+            print(f"[Gemini:{model}] ERROR: {e}")
+            print(f"[Gemini:{model}] Failed after {time.perf_counter() - start:.2f}s.")
+            if _is_rate_limit_error(e):
+                print(f"  -> Rate limit / quota reached for {model}.")
+            return None
+
+
+def _short_error(e: Exception) -> str:
+    text = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
+    return text[:80]
+
+
+def _is_brief_server_error(e: Exception) -> bool:
+    """A temporary problem on Google's side or with the connection - worth
+    one retry. Never a rate limit (retrying would just waste a request) and
+    never a timeout (that would double an already long wait)."""
+    if _is_rate_limit_error(e):
+        return False
+    name = type(e).__name__.lower()
+    msg = str(e).lower()
+    if "timeout" in name or "timed out" in msg or "timeout" in msg:
+        return False
+    if _is_unavailable_error(e):
+        return True
+    return any(m in name for m in ("connecterror", "remoteprotocolerror", "connectionerror")) or any(
+        m in msg for m in ("connection reset", "connection aborted", "server disconnected",
+                           "remote end closed", "eof occurred")
+    )
 
 
 # ============================================================
@@ -1785,73 +2453,6 @@ def call_gemini(image_b64: str, mime: str):
 
 
 # ============================================================
-# OPENROUTER
-# ============================================================
-def call_openrouter(image_b64: str, mime: str, index: int):
-    global _openrouter_json_mode
-
-    tag = f"[OpenRouter #{index}]"
-
-    if openrouter_client is None:
-        print(f"{tag} No API key configured.")
-        return None
-
-    start = time.perf_counter()
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": SOLVER_PROMPT},
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{mime};base64,{image_b64}",
-                        "detail": "high",  # full-detail vision where supported
-                    },
-                },
-            ],
-        }
-    ]
-
-    for attempt in range(1, OPENROUTER_RETRIES + 1):
-        use_json = _openrouter_json_mode and attempt == 1
-
-        print(f"{tag} Attempt {attempt}/{OPENROUTER_RETRIES}...")
-
-        request = {
-            "model": OPENROUTER_MODEL,
-            "messages": messages,
-            "temperature": 0.0,
-            "max_tokens": 4096,
-        }
-        if use_json:
-            request["response_format"] = {"type": "json_object"}
-
-        try:
-            response = openrouter_client.chat.completions.create(**request)
-            result = parse_solver_text(extract_openrouter_content(response))
-
-            print(
-                f"{tag} Found {len(result.tasks)} question(s) "
-                f"in {time.perf_counter() - start:.2f}s "
-                f"(model used: {getattr(response, 'model', 'unknown')})."
-            )
-            return result
-
-        except BadRequestError as e:
-            print(f"[OpenRouter #{index} ERROR] {e}")
-            if use_json:
-                _openrouter_json_mode = False  # remember for future runs
-
-        except Exception as e:
-            print(f"[OpenRouter #{index} ERROR] {e}")
-
-    print(f"{tag} Failed after {time.perf_counter() - start:.2f}s.")
-    return None
-
-
-# ============================================================
 # CONSENSUS HELPERS
 # ============================================================
 def answer_key(task: Task) -> str:
@@ -1927,7 +2528,7 @@ def _cluster_tasks(results):
         for task in result.tasks:
             pt = _task_point(task)
             x1, y1, x2, y2 = _task_pixels(task, w, h)
-            tol = max(8.0, min(40.0, 0.5 * min(x2 - x1, y2 - y1)))
+            tol = max(8.0 * _density(), min(40.0 * _density(), 0.5 * min(x2 - x1, y2 - y1)))
             best = None
             for c in clusters:
                 if c["type"] != task.input_type:
@@ -2091,6 +2692,16 @@ _SNAP_TOLERANCE = 24      # grey-level difference that counts as an edge
 _RECT_BORDER_MIN = 0.9    # share of each border side that must be an edge
 _OPTION_MIN_RADIUS = 4    # px - smaller "holes" are letters like o, e, a
 _OPTION_MAX_RADIUS = 30   # px
+# All pixel sizes above and in the snapping code are for a normal screen.
+# A Retina Mac draws everything with 2x the pixels, so they're multiplied by
+# the screen's density (screenshot pixels per mouse point), measured on every
+# press: 1 on a normal screen, 2 on Retina. Without this, letters like "o"
+# in an option's label are big enough on Retina to pass for a radio button.
+
+
+def _density() -> float:
+    sx = _screen_scale[0] if _screen_scale[0] > 0 else 1.0
+    return max(1.0, min(4.0, 1.0 / sx))
 
 
 class _Gray:
@@ -2144,7 +2755,8 @@ def _find_box(g: _Gray, sx, sy, max_w, max_h):
         return None
     left, right, top, bottom = sx - l, sx + r, sy - u, sy + d
     w, h = right - left + 1, bottom - top + 1
-    if w < 8 or h < 8 or w > max_w or h > max_h:
+    k = _density()
+    if w < 8 * k or h < 8 * k or w > max_w or h > max_h:
         return None
     if left < 1 or top < 1 or right >= g.w - 1 or bottom >= g.h - 1:
         return None
@@ -2183,7 +2795,7 @@ def _find_box(g: _Gray, sx, sy, max_w, max_h):
     if marks:
         mxs = [x for x, _ in marks]
         mys = [y for _, y in marks]
-        is_caret = max(mxs) - min(mxs) <= 2 and max(mys) - min(mys) >= 0.5 * h
+        is_caret = max(mxs) - min(mxs) <= 2 * k and max(mys) - min(mys) >= 0.5 * h
         if not is_caret:
             return None
     return (left, top, right, bottom)
@@ -2193,14 +2805,15 @@ def _find_option(g: _Gray, sx, sy):
     """An empty radio circle / checkbox around seed (sx, sy): its inside as
     (left, top, right, bottom), or None."""
     base = g.px(sx, sy)
-    lim = _OPTION_MAX_RADIUS
+    k = _density()
+    lim = int(_OPTION_MAX_RADIUS * k)
     axis = [_walk(g, sx, sy, dx, dy, base, lim) for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))]
     diag = [_walk(g, sx, sy, dx, dy, base, lim) for dx, dy in ((-1, -1), (1, -1), (-1, 1), (1, 1))]
     if None in axis or None in diag:
         return None
     l, r, u, d = axis
     rx, ry = (l + r + 1) / 2, (u + d + 1) / 2          # radii through the centre
-    if min(rx, ry) < _OPTION_MIN_RADIUS or max(rx, ry) > _OPTION_MAX_RADIUS:
+    if min(rx, ry) < _OPTION_MIN_RADIUS * k or max(rx, ry) > _OPTION_MAX_RADIUS * k:
         return None
     if max(rx, ry) / min(rx, ry) > 1.35:               # must be round / square
         return None
@@ -2228,15 +2841,16 @@ def _candidates(g: _Gray, task: Task):
     pw, ph = max(1.0, x2 - x1), max(1.0, y2 - y1)
     cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
     is_option = task.input_type == "click_option"
+    k = _density()
 
     if is_option:
-        margin = max(16.0, min(60.0, 1.0 * max(pw, ph)))
+        margin = max(16.0 * k, min(60.0 * k, 1.0 * max(pw, ph)))
         find = lambda sx, sy: _find_option(g, sx, sy)
     else:
-        margin = max(8.0, min(60.0, 0.5 * max(pw, ph)))
-        max_w = int(max(3 * pw, pw + 80))
-        max_h = int(max(3 * ph, ph + 50))
-        min_w, min_h = max(8.0, 0.3 * pw), max(8.0, 0.3 * ph)
+        margin = max(8.0 * k, min(60.0 * k, 0.5 * max(pw, ph)))
+        max_w = int(max(3 * pw, pw + 80 * k))
+        max_h = int(max(3 * ph, ph + 50 * k))
+        min_w, min_h = max(8.0 * k, 0.3 * pw), max(8.0 * k, 0.3 * ph)
 
         def find(sx, sy):
             rect = _find_box(g, sx, sy, max_w, max_h)
@@ -2307,7 +2921,7 @@ def snap_tasks(tasks: List[Task], screenshot: Image.Image):
             inside_taken = rect is None and any(
                 l <= click[0] <= r and t <= click[1] <= b for l, t, r, b in taken
             )
-            too_close = any(math.hypot(click[0] - px, click[1] - py) < 6 for px, py in used_points)
+            too_close = any(math.hypot(click[0] - px, click[1] - py) < 6 * _density() for px, py in used_points)
             if inside_taken or too_close:
                 print(
                     f"[SNAP] Q{task.question_id} part {task.part}: would land in a box "
@@ -2357,6 +2971,23 @@ def copy_to_clipboard(text: str) -> bool:
     return False
 
 
+def send_shortcut(key: str):
+    """Ctrl+key on Windows, Cmd+key on a Mac. On a Mac, Command is held down
+    explicitly with a tiny pause around the key: pyautogui's quick hotkey()
+    is known to drop the Command key on some Macs, so the paste never
+    happened. Command is always released, even if something goes wrong."""
+    if not IS_MAC:
+        pyautogui.hotkey(SHORTCUT_KEY, key)
+        return
+    pyautogui.keyDown(SHORTCUT_KEY)
+    try:
+        time.sleep(0.02)
+        pyautogui.press(key)
+        time.sleep(0.02)
+    finally:
+        pyautogui.keyUp(SHORTCUT_KEY)
+
+
 def perform_task(task: Task, width: int, height: int):
     px, py = control_center(task, width, height)       # screenshot pixels
     x, y = to_screen(px, py)                            # mouse coordinates
@@ -2398,9 +3029,9 @@ def perform_task(task: Task, width: int, height: int):
             # WHOLE PAGE instead of just the box's contents.
 
         time.sleep(CLICK_SETTLE_SECONDS)
-        pyautogui.hotkey(SHORTCUT_KEY, "a")
+        send_shortcut("a")  # select everything already in the box
         time.sleep(CLIPBOARD_SETTLE_SECONDS)  # let select-all register first
-        pyautogui.hotkey(SHORTCUT_KEY, "v")
+        send_shortcut("v")  # paste the answer over it
 
 
 def build_tone_wav(notes_hz, notes_ms, volume) -> bytes:
@@ -2529,8 +3160,8 @@ def play_error():
 # AI DISPATCH
 # ============================================================
 def gather_parallel(executor, jobs):
-    """Common as_completed + early-exit + non-blocking-shutdown collection,
-    shared by multi-AI (Gemini+OpenRouter) mode and Gemini Consult mode.
+    """Collect Consult-mode answers as they arrive, stop early once every
+    question already has agreement, and don't wait for stragglers.
     `jobs` maps {future: source_name}."""
     results = []
 
@@ -2579,15 +3210,13 @@ def consult_asks():
 
 def gather_results(image_b64: str, mime: str):
     """
-    Launch AI calls in parallel and collect usable results.
-    - GEMINI_ONLY + GEMINI_CONSULT: every ENABLED Gemini model is queried
-      and must reach the same agreement multi-AI mode requires - no
-      OpenRouter involved.
-    - GEMINI_ONLY (plain or race): a single Gemini request.
-    - Otherwise: Gemini + OpenRouter in parallel, and (if EARLY_EXIT)
-      stop waiting once every question already has agreement.
+    Ask Gemini and collect usable results.
+    - GEMINI_CONSULT: every enabled model is asked (GEMINI_CONSULT_REPEAT
+      times each) in parallel and they must agree; stops waiting once every
+      question already has agreement (EARLY_EXIT).
+    - Otherwise (plain, race or Flash Cycle): a single Gemini request.
     """
-    if GEMINI_ONLY and GEMINI_CONSULT:
+    if GEMINI_CONSULT:
         asks = consult_asks()
         if len(asks) < 2:
             print(
@@ -2598,25 +3227,13 @@ def gather_results(image_b64: str, mime: str):
         jobs = {executor.submit(call_gemini_model, m, image_b64, mime): label for label, m in asks}
         return gather_parallel(executor, jobs)
 
-    if GEMINI_ONLY:
-        # One request: run it right here, no thread pool overhead.
-        try:
-            result = call_gemini(image_b64, mime)
-        except Exception as e:
-            print(f"[Gemini FATAL] {e}")
-            result = None
-        return [("Gemini", result)] if result else []
-
-    executor = ThreadPoolExecutor(max_workers=1 + OPENROUTER_CALLS)
-
-    jobs = {executor.submit(call_gemini, image_b64, mime): "Gemini"}
-
-    for i in range(1, OPENROUTER_CALLS + 1):
-        jobs[executor.submit(call_openrouter, image_b64, mime, i)] = (
-            f"OpenRouter #{i}"
-        )
-
-    return gather_parallel(executor, jobs)
+    # One request: run it right here, no thread pool overhead.
+    try:
+        result = call_gemini(image_b64, mime)
+    except Exception as e:
+        print(f"[Gemini FATAL] {e}")
+        result = None
+    return [("Gemini", result)] if result else []
 
 
 # ============================================================
@@ -2709,21 +3326,69 @@ def perform_tasks_with_gap(tasks, width: int, height: int):
 
 
 def uses_single_result():
-    """True when a solve just takes the one result directly (plain Gemini
-    or race mode); False whenever multiple sources need to agree first
-    (Consult mode, or Gemini+OpenRouter multi-AI mode)."""
-    return GEMINI_ONLY and not GEMINI_CONSULT
+    """True when a solve just takes the one result directly (plain, race or
+    Flash Cycle); False in Consult mode, where several answers must agree."""
+    return not GEMINI_CONSULT
+
+
+def _screenshot_name() -> str:
+    stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    millis = int((time.time() % 1) * 1000)
+    return f"screenshot_{stamp}-{millis:03d}"
+
+
+def _zip_is_healthy(path: str) -> bool:
+    """A real zip that starts at the beginning of the file (no junk in front
+    of it, no missing index at the end). Only reads the index - fast."""
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) not in (b"PK\x03\x04", b"PK\x05\x06"):
+                return False
+        with zipfile.ZipFile(path) as zf:
+            zf.namelist()
+        return True
+    except Exception:
+        return False
+
+
+def _add_to_zip(png_bytes: bytes, base: str) -> str:
+    """Add one PNG to SCREENSHOT_ZIP (created if missing). If the zip is
+    damaged (e.g. the PC lost power while writing it), it's renamed out of
+    the way and a fresh one is started, so saving never gets stuck."""
+    # Checked first on purpose: zipfile's "a" mode doesn't complain about a
+    # damaged file, it silently starts a new zip on the end of it, which
+    # would hide every screenshot already in there.
+    if os.path.exists(SCREENSHOT_ZIP) and not _zip_is_healthy(SCREENSHOT_ZIP):
+        broken = SCREENSHOT_ZIP[:-4] + f"_damaged_{time.strftime('%Y-%m-%d_%H-%M-%S')}.zip"
+        os.replace(SCREENSHOT_ZIP, broken)
+        print(f"[SCREENSHOT] {os.path.basename(SCREENSHOT_ZIP)} was damaged - kept it as "
+              f"{os.path.basename(broken)} and started a new one.")
+    with zipfile.ZipFile(SCREENSHOT_ZIP, "a") as zf:
+        existing = set(zf.namelist())
+        name, n = base + ".png", 1
+        while name in existing:  # two presses in the same millisecond
+            name = f"{base}_{n}.png"
+            n += 1
+        # PNG is already compressed: store it as-is (instant, same size).
+        zf.writestr(name, png_bytes, compress_type=zipfile.ZIP_STORED)
+    return name
 
 
 def save_screenshot(screenshot: Image.Image):
-    """Save this exact screenshot to SCREENSHOT_FOLDER under a unique,
-    timestamped name. Never raises: a failed save is reported but never
+    """Save this exact screenshot under a unique, timestamped name - into
+    SCREENSHOT_ZIP when AUTO_ZIP_SCREENSHOTS is on, otherwise into
+    SCREENSHOT_FOLDER. Never raises: a failed save is reported but never
     stops the solve itself."""
     try:
+        base = _screenshot_name()
+        if AUTO_ZIP_SCREENSHOTS:
+            buf = io.BytesIO()
+            screenshot.save(buf, "PNG", compress_level=1)  # fast, still lossless
+            name = _add_to_zip(buf.getvalue(), base)
+            print(f"Saved screenshot: {SCREENSHOT_ZIP} -> {name}")
+            return SCREENSHOT_ZIP
+
         os.makedirs(SCREENSHOT_FOLDER, exist_ok=True)  # recreate if deleted
-        stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-        millis = int((time.time() % 1) * 1000)
-        base = f"screenshot_{stamp}-{millis:03d}"
         path = os.path.join(SCREENSHOT_FOLDER, base + ".png")
         n = 1
         while os.path.exists(path):  # two presses in the same millisecond
@@ -2785,6 +3450,21 @@ def capture_and_solve():
     return final_tasks, results, width, height, timing, screenshot
 
 
+def return_mouse(pos):
+    """Move the mouse back to `pos` (mouse coordinates, as given by
+    pyautogui.position()) instantly, without clicking. A spot in a screen
+    corner is nudged 1 px inward, because the next mouse action would
+    otherwise trigger the top-left emergency stop."""
+    try:
+        x, y = int(pos[0]), int(pos[1])
+        w, h = pyautogui.size()
+        x = min(max(x, 1), w - 2)
+        y = min(max(y, 1), h - 2)
+        pyautogui.moveTo(x, y, duration=0)
+    except Exception as e:
+        print(f"[MOUSE] Could not move the mouse back: {e}")
+
+
 def run_solver():
     if not busy_lock.acquire(blocking=False):
         print("\n[BUSY] A solve is already running.")
@@ -2792,18 +3472,17 @@ def run_solver():
 
     start_time = time.perf_counter()
     emergency_stop = False
+    mouse_start = None  # where the mouse was just before answering
 
     try:
-        if GEMINI_ONLY and GEMINI_CONSULT:
+        if GEMINI_CONSULT:
             mode_label = "GEMINI CONSULT"
-        elif GEMINI_ONLY and USE_GEMINI_FLASH_CYCLE:
+        elif USE_GEMINI_FLASH_CYCLE:
             mode_label = f"GEMINI FLASH CYCLE - {cycle_next_model() or 'all used up'}"
-        elif GEMINI_ONLY and USE_GEMINI_FLASH_RACE:
+        elif USE_GEMINI_FLASH_RACE:
             mode_label = "GEMINI FLASH RACE"
-        elif GEMINI_ONLY:
-            mode_label = "GEMINI ONLY"
         else:
-            mode_label = "MULTI-AI CONSENSUS"
+            mode_label = f"GEMINI - {GEMINI_MODEL or 'no model enabled'}"
 
         print("\n" + "=" * 70)
         print(f"CAPTURING SCREEN  (mode: {mode_label})")
@@ -2866,6 +3545,12 @@ def run_solver():
             play_error()
             return
 
+        if RETURN_MOUSE_WHEN_DONE and not TEST_MODE:
+            try:
+                mouse_start = tuple(pyautogui.position())
+            except Exception:
+                mouse_start = None
+
         perform_tasks_with_gap(actions, width, height)
 
         if deferred:
@@ -2904,6 +3589,8 @@ def run_solver():
         play_error()
 
     finally:
+        if mouse_start is not None and not emergency_stop:
+            return_mouse(mouse_start)
         try:
             # Taken AFTER the solve and the clicking/typing, so it shows the
             # result. Skipped on an emergency stop so nothing more happens.
@@ -2917,7 +3604,7 @@ def run_solver():
 
 
 # ============================================================
-# MAC HOTKEY (pynput)
+# MAC HOTKEY (macOS's own event tap; pynput only as a backup)
 # ============================================================
 # macOS virtual key codes of the physical keys (US layout positions). Keys
 # are matched by these codes, not by the typed letter, because on a Mac
@@ -2928,6 +3615,9 @@ _MAC_VK = {
     "1": 18, "2": 19, "3": 20, "4": 21, "6": 22, "5": 23, "9": 25, "7": 26,
     "8": 28, "0": 29, "o": 31, "u": 32, "i": 34, "p": 35, "l": 37, "j": 38,
     "k": 40, "n": 45, "m": 46,
+    "space": 49, "tab": 48, "enter": 36, "return": 36, "esc": 53, "escape": 53,
+    "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97, "f7": 98,
+    "f8": 100, "f9": 101, "f10": 109, "f11": 103, "f12": 111,
 }
 _MOD_NAMES = {
     "ctrl": "ctrl", "control": "ctrl",
@@ -3005,13 +3695,141 @@ def make_mac_hotkey_handlers(hotkey: str, callback, kb):
     return on_press, on_release
 
 
+_mac_permission_warned = False
+
+
+def check_mac_permissions():
+    """At startup, check the macOS permissions the solver needs and say
+    plainly which are missing. Asking also makes macOS show its permission
+    prompt and put Terminal in that list, so you only have to switch it on.
+    (Input Monitoring can't be checked reliably from a script, so it's only
+    reported later if key presses don't come through.)"""
+    global _mac_permission_warned
+    missing = []
+    try:
+        import Quartz
+        preflight = getattr(Quartz, "CGPreflightScreenCaptureAccess", None)
+        if preflight is not None and not preflight():
+            request = getattr(Quartz, "CGRequestScreenCaptureAccess", None)
+            if request is not None:
+                request()
+            missing.append("Screen Recording (called 'Screen & System Audio Recording' on "
+                           "newer macOS) - without it the screenshot shows only your "
+                           "wallpaper, so no questions are found")
+    except Exception:
+        pass
+    try:
+        import HIServices
+        trusted = HIServices.AXIsProcessTrustedWithOptions(
+            {HIServices.kAXTrustedCheckOptionPrompt: True}
+        )
+        if not trusted:
+            missing.append("Accessibility - needed to click and type the answers")
+    except Exception:
+        pass
+    if missing:
+        _mac_permission_warned = True
+        print("\nWARNING: macOS hasn't given the app you run this from (usually Terminal)")
+        print("these permissions yet:")
+        for item in missing:
+            print(f"  - {item}")
+        print("Open System Settings -> Privacy & Security, turn that app ON in each of")
+        print("them (and in 'Input Monitoring' for the hotkey), then quit the app")
+        print("completely (Cmd+Q), reopen it, and run this again.")
+    return missing
+
+
+def run_mac_hotkey_native(hotkey: str, callback) -> bool:
+    """Listen for the hotkey with macOS's own keyboard "event tap", on the
+    program's MAIN thread, until Ctrl+C.
+
+    Why not pynput: on recent macOS (Sonoma / Sequoia) pynput's listener can
+    crash the program the moment it starts - it looks up the keyboard layout
+    from a background thread, which macOS no longer allows - and Caps Lock
+    can crash it on some Macs. This tap only needs the physical key code and
+    the modifier keys, so it never asks for the keyboard layout, and it runs
+    on the main thread. It uses Quartz, which comes with pyautogui.
+
+    Returns False if it can't be used here (the caller then uses pynput)."""
+    try:
+        import Quartz
+    except ImportError:
+        return False
+    mods, key = parse_hotkey(hotkey)
+    target_vk = _MAC_VK.get(key or "")
+    if target_vk is None:
+        return False  # a key this table doesn't know: let pynput handle it
+
+    bits = {
+        "ctrl": Quartz.kCGEventFlagMaskControl,
+        "alt": Quartz.kCGEventFlagMaskAlternate,
+        "shift": Quartz.kCGEventFlagMaskShift,
+        "cmd": Quartz.kCGEventFlagMaskCommand,
+    }
+    any_mod = 0
+    for b in bits.values():
+        any_mod |= b
+    need = 0
+    for m in mods:
+        need |= bits[m]
+    state = {"tap": None}
+
+    def handler(proxy, event_type, event, refcon):
+        try:
+            if event_type in (Quartz.kCGEventTapDisabledByTimeout,
+                              Quartz.kCGEventTapDisabledByUserInput):
+                # macOS switches a tap off if it's ever slow - switch it back on.
+                if state["tap"] is not None:
+                    Quartz.CGEventTapEnable(state["tap"], True)
+            elif event_type == Quartz.kCGEventKeyDown:
+                vk = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
+                repeat = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventAutorepeat)
+                if vk == target_vk and not repeat and (Quartz.CGEventGetFlags(event) & any_mod) == need:
+                    callback()
+        except Exception as e:  # never let an error stop the key listener
+            print(f"[HOTKEY] {e}")
+        return event
+
+    tap = Quartz.CGEventTapCreate(
+        Quartz.kCGSessionEventTap,
+        Quartz.kCGHeadInsertEventTap,
+        Quartz.kCGEventTapOptionListenOnly,  # only watches keys, never blocks them
+        Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown),
+        handler,
+        None,
+    )
+    if tap is None:
+        # No permission to watch the keyboard. Asking makes macOS show its
+        # prompt and put Terminal in the Input Monitoring list.
+        request = getattr(Quartz, "CGRequestListenEventAccess", None)
+        if request is not None:
+            try:
+                request()
+            except Exception:
+                pass
+        print("\nERROR: macOS isn't letting this program watch the keyboard, so the")
+        print("hotkey can't work. Open System Settings -> Privacy & Security ->")
+        print("Input Monitoring (and Accessibility) and turn ON the app you run this")
+        print("from (usually Terminal). Then quit that app completely (Cmd+Q),")
+        print("reopen it, and run this again.")
+        sys.exit(1)
+
+    state["tap"] = tap
+    source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+    Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), source, Quartz.kCFRunLoopCommonModes)
+    Quartz.CGEventTapEnable(tap, True)
+    # Short slices instead of one endless wait, so Ctrl+C still quits.
+    while True:
+        Quartz.CFRunLoopRunInMode(Quartz.kCFRunLoopDefaultMode, 0.5, False)
+
+
 def run_mac_hotkey(hotkey: str, callback):
     """Listen for the hotkey on macOS until Ctrl+C."""
     kb = pynput_keyboard
     on_press, on_release = make_mac_hotkey_handlers(hotkey, callback, kb)
     with kb.Listener(on_press=on_press, on_release=on_release) as listener:
         time.sleep(0.5)
-        if getattr(listener, "IS_TRUSTED", True) is False:
+        if getattr(listener, "IS_TRUSTED", True) is False and not _mac_permission_warned:
             print("\nWARNING: macOS isn't letting this program see key presses, so the")
             print("hotkey won't work yet. Open System Settings -> Privacy & Security, and")
             print("turn Terminal ON under BOTH 'Accessibility' and 'Input Monitoring'.")
@@ -3031,12 +3849,6 @@ def warm_up():
         except Exception:
             pass
 
-    def _openrouter():
-        try:
-            openrouter_client.models.list()
-        except Exception:
-            pass
-
     if gemini_client is not None:
         if GEMINI_CONSULT:
             warm_models = enabled_gemini_models()
@@ -3049,8 +3861,6 @@ def warm_up():
         for model in warm_models:
             if model:
                 threading.Thread(target=_gemini, args=(model,), daemon=True).start()
-    if openrouter_client is not None:
-        threading.Thread(target=_openrouter, daemon=True).start()
 
 
 # ============================================================
@@ -3063,7 +3873,6 @@ if __name__ == "__main__":
     print(f"Version:     {SOLVER_VERSION} on {'Mac' if IS_MAC else 'Windows' if sys.platform == 'win32' else sys.platform}")
     print(f"Hotkey:      {hotkey_display(HOTKEY)}")
     print(f"Test mode:   {TEST_MODE}")
-    print(f"Gemini only: {GEMINI_ONLY}")
     if GEMINI_CONSULT:
         asks = consult_asks()
         print(
@@ -3097,8 +3906,7 @@ if __name__ == "__main__":
     if GEMINI_CODE_EXECUTION:
         maths.append("Python in Google's sandbox (slow)")
     print(f"Maths:       {' + '.join(maths) or 'AI only'}")
-    if not GEMINI_ONLY:
-        print(f"OpenRouter:  {OPENROUTER_MODEL} x{OPENROUTER_CALLS}")
+    print(f"References:  {'ON' if USE_TEXTBOOKS_AND_REFERENCES else 'off'}")
     print()
     print(f"Press {hotkey_display(HOTKEY)} to capture and analyze the current screen.")
     print("Emergency stop: move the mouse to the TOP-LEFT corner.")
@@ -3110,11 +3918,6 @@ if __name__ == "__main__":
     elif not GEMINI_API_KEY:
         print("WARNING: GEMINI_API_KEY is not set. Add GEMINI_API_KEY=your_key to .env")
         print("         next to this script.")
-    if not GEMINI_ONLY and not OPENROUTER_API_KEY:
-        if key_is_placeholder("OPENROUTER_API_KEY"):
-            print("WARNING: OPENROUTER_API_KEY in .env is still a placeholder.")
-        else:
-            print("WARNING: GEMINI_ONLY is off but OPENROUTER_API_KEY is not set.")
     if GEMINI_CONSULT and len(consult_asks()) < 2:
         print("WARNING: GEMINI_CONSULT needs at least 2 answers per press - turn on another")
         print("         model or set GEMINI_CONSULT_REPEAT to 2 or more.")
@@ -3124,7 +3927,14 @@ if __name__ == "__main__":
           and not USE_GEMINI_FLASH_RACE and GEMINI_MODEL is None):
         print("WARNING: no Gemini model enabled (all USE_GEMINI_... are False).")
 
+    if IS_MAC:
+        check_mac_permissions()  # before anything else prints in the background
+
     prepare_sounds()  # built before the first press
+
+    ensure_reference_folder()  # made on the first run, whether the switch is on or not
+    if USE_TEXTBOOKS_AND_REFERENCES:
+        start_textbook_loading()
 
     if WARM_UP_CONNECTIONS:
         warm_up()
@@ -3137,11 +3947,13 @@ if __name__ == "__main__":
 
     try:
         if IS_MAC:
-            if pynput_keyboard is None:
-                print("\nERROR: the 'pynput' package is missing. Run this, then start again:")
-                print("    python3 -m pip install pynput")
-                sys.exit(1)
-            run_mac_hotkey(HOTKEY, on_hotkey)
+            if not run_mac_hotkey_native(HOTKEY, on_hotkey):
+                # Backup only (Quartz missing, or an unusual hotkey key).
+                if pynput_keyboard is None:
+                    print("\nERROR: the 'pynput' package is missing. Run this, then start again:")
+                    print("    python3 -m pip install pynput")
+                    sys.exit(1)
+                run_mac_hotkey(HOTKEY, on_hotkey)
         else:
             keyboard.add_hotkey(HOTKEY, on_hotkey)
             keyboard.wait()

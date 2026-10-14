@@ -101,15 +101,17 @@ You only need steps **2.3** and **2.4** each time you want to use it: go to the 
 
 **Windows:**
 ```
-py -m pip install keyboard pyautogui pyperclip python-dotenv google-genai openai pillow pydantic
+py -m pip install keyboard pyautogui pyperclip python-dotenv google-genai pillow pydantic pymupdf
 ```
 
 **Mac:**
 ```
-python3 -m pip install pynput pyautogui pyperclip python-dotenv google-genai openai pillow pydantic
+python3 -m pip install pynput pyautogui pyperclip python-dotenv google-genai pillow pydantic pymupdf
 ```
 
-(The two lists differ on purpose: on a Mac the hotkey uses `pynput` instead of `keyboard`.)
+(The two lists differ on purpose: on a Mac, `pynput` replaces `keyboard`. `pymupdf` reads PDF textbooks for the optional Textbooks and References feature.)
+
+> Already installed an older version? Run the line again; it only adds what's missing. `openai` isn't needed any more.
 
 ### 2.3 Get a free Gemini API key (one time only)
 1. Go to **[aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)** and sign in with a Google account.
@@ -155,7 +157,7 @@ Replace `ENTER_KEY_HERE` with the key you copied (no spaces, no quotes). Save th
 
 ### 2.6 Mac only: allow Terminal to see the screen and use the keyboard (one time only)
 
-Open **System Settings → Privacy & Security** and turn **Terminal** on in all three of these lists:
+Open **System Settings → Privacy & Security** and turn **Terminal** on in all three of these lists (if you run the solver from another app, like iTerm or VS Code, turn on that app instead):
 
 | Setting | Why the solver needs it |
 | --- | --- |
@@ -164,6 +166,8 @@ Open **System Settings → Privacy & Security** and turn **Terminal** on in all 
 | **Screen Recording** (called **Screen & System Audio Recording** on newer macOS) | to take the screenshot the AI reads |
 
 If Terminal isn't in a list, click **+**, go to **Applications → Utilities**, and choose **Terminal**. Afterwards **quit Terminal completely (`Cmd + Q`)** and open it again. The permissions only take effect after a restart.
+
+> The solver checks these when it starts. If one is missing, macOS may pop up its own permission prompt, and the solver prints exactly which one to turn on.
 
 ### 2.7 Run it
 
@@ -178,11 +182,11 @@ python3 solver.py
 ```
 
 ### 2.8 Use it
-1. Leave the Terminal window open and switch to your browser with the questions.
+1. Leave the Terminal window open and switch to your browser with the questions. If Textbooks and References is on, wait for the line `[REFERENCES] … files loaded - ready, you can start` first.
 2. Press the hotkey:
    - **Windows:** `Ctrl + Alt + S`
    - **Mac:** `Control + Option + S`
-3. Wait for the chime: a rising chime means the answers were filled in; a low tone means the AI didn't give a usable answer (press again).
+3. Wait for the chime: a rising chime means the answers were filled in; a low tone means the AI didn't give a usable answer (press again). Your mouse goes back to where it was.
 4. For questions whose next part appears after you answer, just press the hotkey again.
 
 **Emergency stop:** quickly move your mouse into the **top-left corner** of the screen.
@@ -191,13 +195,27 @@ python3 solver.py
 ### From now on
 You only need steps **2.4** and **2.7** each time you want to use it: go to the folder, then run it.
 
+### Textbooks and References (optional)
+For **non-math multiple-choice** questions (definitions, concepts, "which term does this scenario describe?"), the solver can look terms up in your own course files. Math questions are answered exactly the same either way.
+
+1. Run the solver once. It creates a folder called **`Textbooks and References`** inside the `AI_Solver` folder.
+2. Put your files in that folder: **PDFs** (textbooks, notes, slides saved as PDF), **PowerPoint** (`.pptx`, including speaker notes), **Word** (`.docx`), or **`.txt`** files. Long file names are fine.
+3. Set `USE_TEXTBOOKS_AND_REFERENCES = True` (see Settings below) and run the solver again.
+
+On start it shows one line counting up (`1/3`, `2/3`, `3/3`) and then `… files loaded - ready, you can start`. The first start reads each file once; after that it starts almost instantly. If you add or change a file, restart the solver.
+
+> Old `.doc` / `.ppt` files and scanned PDFs (pictures of pages) can't be read. Open old files and use **Save As → .docx / .pptx**.
+
 ### Settings (optional)
 The settings are simple `True`/`False` switches near the top of `solver.py`. Open it with `notepad solver.py` (Windows) or `open -e solver.py` (Mac), change a value, save, and run the program again.
 
 | Setting | What it does |
 | --- | --- |
-| `SAVE_SCREENSHOTS` | `True` = saves a screenshot after every press (with red rings where it clicked) into a `tempscreenshots` folder. |
+| `SAVE_SCREENSHOTS` | `True` = saves a screenshot after every press, so you can check what was filled in. |
+| `AUTO_ZIP_SCREENSHOTS` | `True` = puts those screenshots into one `tempscreenshots.zip` file instead of a `tempscreenshots` folder. |
 | `PLAY_SOUNDS` | turns the chime / error tone on or off. |
+| `RETURN_MOUSE_WHEN_DONE` | `True` = puts your mouse back where it was after the answers are filled in. |
+| `USE_TEXTBOOKS_AND_REFERENCES` | `True` = looks up terms in your `Textbooks and References` folder for non-math multiple-choice questions (see above). |
 
 ### Troubleshooting
 
@@ -207,8 +225,12 @@ The settings are simple `True`/`False` switches near the top of `solver.py`. Ope
 | Mac: `error: externally-managed-environment` when installing | You're using Homebrew's Python. Install Python from python.org (Step 1), open a new Terminal, and try again. |
 | `No such file or directory` / `can't open file` | You're in the wrong folder, or the folder isn't in Downloads. Check the folder name and redo the `cd` step. |
 | `WARNING: GEMINI_API_KEY ... ENTER_KEY_HERE` | You haven't put your key in `.env` yet (step 2.5), or didn't save the file. |
-| Mac: pressing the hotkey does nothing | Redo step 2.6. All three permissions must be on for Terminal, and Terminal must be fully restarted (`Cmd + Q`). |
+| Mac: pressing the hotkey does nothing, or `macOS isn't letting this program watch the keyboard` | Redo step 2.6. All three permissions must be on for Terminal, and Terminal must be fully restarted (`Cmd + Q`). |
+| Mac: `WARNING: macOS hasn't given the app you run this from … these permissions yet` | Turn on the permissions it lists (step 2.6), then fully restart Terminal (`Cmd + Q`). |
 | Mac: the screenshot shows only your wallpaper | Screen Recording permission is missing (step 2.6). |
+| `[REFERENCES] PDF files need PyMuPDF` | Run the install line in step 2.2 again, then restart the solver. |
+| `[REFERENCES] … old .doc format` (or `.ppt`) | Open the file and use **Save As → .docx** (or **.pptx**), then restart the solver. |
+| `[REFERENCES] … almost no text - probably scanned images` | That PDF is pictures of pages, which can't be searched. Use a text PDF if you have one. |
 | `429` / `RESOURCE_EXHAUSTED` / "limit used up" | That model's free daily limit is used up. It resets at midnight Pacific time. |
 
 </details>
